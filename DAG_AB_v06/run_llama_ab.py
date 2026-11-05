@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -27,6 +28,25 @@ except ImportError as exc:
 
 MODES = ('baseline', 'resident', 'stream50', 'stream25', 'stream10')
 FRACTIONS = {'stream50': .50, 'stream25': .25, 'stream10': .10}
+
+
+def ratio_or_none(numerator, denominator):
+    """Return a finite ratio or JSON null when baseline cannot be measured.
+
+    In fast HTTP mock tests, client TTFT and sampled process RSS may be zero
+    (especially on Windows). A zero baseline is not evidence of a speedup.
+    """
+    if numerator is None or denominator is None:
+        return None
+    try:
+        n = float(numerator)
+        d = float(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(n) or not math.isfinite(d) or d <= 0:
+        return None
+    result = n / d
+    return result if math.isfinite(result) else None
 
 
 def now(): return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
@@ -275,10 +295,11 @@ def main(argv=None):
         for mode,pdata in report['phases'].items():
             if mode=='baseline':continue
             pdata['relative_to_baseline']={
-                'decode_speedup':pdata['median_decode_tps']/ref['median_decode_tps'],
-                'ttft_ratio':pdata['median_client_ttft_s']/ref['median_client_ttft_s'],
-                'peak_rss_ratio':pdata['memory']['peak_server_process_tree_rss_bytes']/
-                                  ref['memory']['peak_server_process_tree_rss_bytes'],
+                'decode_speedup':ratio_or_none(pdata['median_decode_tps'], ref['median_decode_tps']),
+                'ttft_ratio':ratio_or_none(pdata['median_client_ttft_s'], ref['median_client_ttft_s']),
+                'peak_rss_ratio':ratio_or_none(
+                    pdata['memory']['peak_server_process_tree_rss_bytes'],
+                    ref['memory']['peak_server_process_tree_rss_bytes']),
                 'same_token_ids_first_trial':pdata['trials'][0]['token_ids_sha256']==
                                                ref['trials'][0]['token_ids_sha256']}
     report['status']='complete';report['finished_utc']=now();atomic_json(path,report)
