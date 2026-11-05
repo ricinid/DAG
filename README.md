@@ -149,3 +149,24 @@ py -m pytest -q
 - The only credible next milestone for end-to-end claims is a real llama.cpp
   GGML matrix-operation backend that executes `.adagstream` plus passthrough
   tensor ops, with correctness validation and full-process memory metrics.
+
+## Ollama model resolution on Windows
+
+Model names such as `qwen2.5-coder:3b` contain a version dot, which must NOT
+be treated as a registry hostname. The resolver now checks the standard
+manifest and uses the running Ollama service `/api/show` as a fallback for
+custom `OLLAMA_MODELS` locations.
+
+If the model is pulled but Python still cannot find a locally readable GGUF:
+
+```powershell
+ollama list
+ollama show --modelfile qwen2.5-coder:3b
+```
+
+Copy the absolute path after `FROM` and pass it as `--gguf` to
+`ab_experiment.py`, or pass the service's models root with `--models-dir`.
+The model file must be accessible on the machine running the compiler.
+Use a fresh `--out-dir` for each experiment: reports are not overwritten.
+
+After `git pull`, rerun without `--pull` if the model is already installed.
