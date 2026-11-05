@@ -1,0 +1,4 @@
+numpy>=1.26
+psutil>=5.9
+pytest>=8.0
+# Optional: install CUDA-enabled PyTorch for VRAM profiles.

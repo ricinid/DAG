@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.gguf
+*.adag
+*.dagpack
+*.safetensors
+*.npz
+*.pyc
+dag_results/
+.venv/
