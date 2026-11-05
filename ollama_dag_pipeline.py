@@ -25,6 +25,7 @@ import json
 import math
 import mmap
 import os
+import re
 import struct
 import sys
 import time
@@ -108,10 +109,43 @@ def model_roots(specified: str | None) -> list[Path]:
     return [Path.home()/'.ollama'/'models', Path('/usr/share/ollama/.ollama/models')]
 
 
-def resolve_ollama_blob(model: str, specified: str | None = None) -> Path:
+
+def _blob_from_ollama_show(model: str, ollama_url: str) -> Path | None:
+    """Read the actual model GGUF path from the Ollama server Modelfile."""
+    details = post_json(ollama_url, '/api/show', {'model': model}, timeout=30)
+    modelfile = details.get('modelfile', '')
+    for line in modelfile.splitlines():
+        match = re.match(r'^\s*FROM\s+(.+?)\s*$', line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        raw = match.group(1).strip().strip('"')
+        if not raw:
+            continue
+        blob = Path(raw).expanduser()
+        candidates = [blob]
+        if blob.name.startswith('sha256:'):
+            candidates.append(blob.with_name('sha256-' + blob.name[7:]))
+        for candidate in candidates:
+            if candidate.is_file():
+                with candidate.open('rb') as stream:
+                    if stream.read(4) == b'GGUF':
+                        return candidate
+        break
+    return None
+
+
+def resolve_ollama_blob(model: str, specified: str | None = None,
+                        ollama_url: str | None = None) -> Path:
+    """Resolve local GGUF from manifest or the running Ollama service.
+
+    The server may use a different OLLAMA_MODELS root than Python's process.
+    Remote server paths still require a locally accessible model file.
+    """
     manifest = model_to_manifest(model)
+    checked = []
     for root in model_roots(specified):
         path = root / manifest
+        checked.append(str(path))
         if not path.is_file():
             continue
         data = json.loads(path.read_text(encoding='utf-8'))
@@ -125,9 +159,22 @@ def resolve_ollama_blob(model: str, specified: str | None = None) -> Path:
         blob = root/'blobs'/('sha256-'+digest.split(':',1)[1])
         if blob.is_file():
             return blob
-        raise FileNotFoundError(f'Ollama manifest resolved but blob missing: {blob}')
-    raise FileNotFoundError(f'Cannot find local Ollama manifest for {model!r}. Pull it first, '
-                            'or set --models-dir / OLLAMA_MODELS to the service model root.')
+        checked.append(str(blob))
+    lookup_error = None
+    if ollama_url:
+        try:
+            result = _blob_from_ollama_show(model, ollama_url)
+            if result is not None:
+                return result
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            lookup_error = str(exc)
+    extra = f' Ollama /api/show lookup error: {lookup_error}.' if lookup_error else ''
+    raise FileNotFoundError(
+        f'Cannot locate a locally readable GGUF for {model!r}. '
+        f'Checked manifest/blob paths: {"; ".join(checked)}. '
+        'Try: ollama show --modelfile '
+        f'{model}, then pass its FROM path as --gguf, '
+        'or use --models-dir to point to the Ollama service model root.' + extra)
 
 
 @dataclass(frozen=True)
@@ -663,7 +710,7 @@ def main(argv=None):
         return
     if args.pull and not args.model: p.error('--pull requires --model')
     if args.pull: post_json(args.ollama_url,'/api/pull',{'model':args.model,'stream':True})
-    source=Path(args.gguf) if args.gguf else resolve_ollama_blob(args.model,args.models_dir)
+    source=Path(args.gguf) if args.gguf else resolve_ollama_blob(args.model,args.models_dir,args.ollama_url)
     with GGUFReader(source) as gguf:
         if args.command=='inspect':
             jprint({'model':args.model,'gguf':str(source),'gguf_bytes':source.stat().st_size,
