@@ -11,7 +11,8 @@ else:
     sys.path.insert(0, '/mnt/data/dag_cse_fast')
 from test_ollama_dag_pipeline import fake_gguf
 from whole_model_dag import compile_full
-from run_llama_ab import main
+from run_llama_ab import main, ratio_or_none
+import run_llama_ab
 
 FAKE_SERVER = '''#!/usr/bin/env python3
 import argparse,json,os,time,sys
@@ -57,3 +58,42 @@ def test_full_four_stage_harness_and_ratios(tmp_path):
         assert d['relative_to_baseline']['same_token_ids_first_trial']
     assert report['phases']['stream50']['cache_budget_bytes']==gguf.stat().st_size//2
     assert report['phases']['stream10']['cache_budget_bytes']==int(gguf.stat().st_size*.1)
+
+def test_ratio_or_none_handles_unmeasurable_baselines():
+    assert ratio_or_none(0, 0) is None
+    assert ratio_or_none(1, 0) is None
+    assert ratio_or_none(12, None) is None
+    assert ratio_or_none(None, 2) is None
+    assert ratio_or_none(float('inf'), 2) is None
+    assert ratio_or_none(2, float('nan')) is None
+    assert ratio_or_none(6, 3) == 2.0
+
+
+def test_zero_baseline_ttft_does_not_fail_full_report(tmp_path, monkeypatch):
+    gguf, _ = fake_gguf(tmp_path, 2, rows=3, cols=256)
+    compiled = tmp_path / 'compiled'
+    compile_full(gguf, compiled, rows=3, cols=256, max_nodes=2)
+    server = tmp_path / 'fake-server.py'
+    server.write_text(FAKE_SERVER)
+    out = tmp_path / 'ab_zero_ttft'
+    original_completion = run_llama_ab.completion
+    n = 0
+
+    def controlled_ttft(*args, **kwargs):
+        nonlocal n
+        result = original_completion(*args, **kwargs)
+        n += 1
+        if n == 1:  # The baseline is faster than timer resolution.
+            result['client_ttft_s'] = 0.0
+        return result
+
+    monkeypatch.setattr(run_llama_ab, 'completion', controlled_ttft)
+    assert main(['--server', str(server), '--gguf', str(gguf),
+                 '--compiled', str(compiled), '--out-dir', str(out),
+                 '--port', '19988', '--trials', '1',
+                 '--modes', 'baseline', 'stream50']) == 0
+    report = json.loads((out / 'full_inference_ab.json').read_text())
+    assert report['status'] == 'complete'
+    ratio = report['phases']['stream50']['relative_to_baseline']
+    assert ratio['ttft_ratio'] is None
+    assert ratio['decode_speedup'] == 1.0
