@@ -129,6 +129,8 @@ def compile_full(source: Path, out: Path, *, rows: int = 32, cols: int = 256,
             fstream.truncate(committed_end)
         elapsed_start=time.monotonic()
         new_units=0
+        last_console_progress=time.monotonic()
+        print(f'[DAG CSE] resume {completed:,}/{total_units:,} work units; checkpoint intact',flush=True)
         original_bytes_compiled=0
         dag_bytes_compiled=0
         shared_nodes=0
@@ -163,8 +165,17 @@ def compile_full(source: Path, out: Path, *, rows: int = 32, cols: int = 256,
                 dag_bytes_compiled+=len(blob)
                 shared_nodes+=entry['shared_nodes']
                 if new_units%10==0 or sequence+1==total_units:
-                    log_event(events,'compile_progress',completed=sequence+1,total=total_units,
-                              elapsed_seconds=round(time.monotonic()-elapsed_start,2))
+                    elapsed=time.monotonic()-elapsed_start
+                    done=sequence+1
+                    log_event(events,'compile_progress',completed=done,total=total_units,
+                              elapsed_seconds=round(elapsed,2))
+                    if time.monotonic()-last_console_progress >= 15 or done==total_units:
+                        rate=new_units/elapsed if elapsed>0 else 0
+                        remaining=(total_units-done)/rate/3600 if rate else None
+                        eta=f'{remaining:.1f}h' if remaining is not None else 'unknown'
+                        print(f'[DAG CSE] {done:,}/{total_units:,} ({done/total_units:.2%}) '
+                              f'| {rate:.2f} new units/s | ETA {eta}',flush=True)
+                        last_console_progress=time.monotonic()
             finished=completed+new_units==total_units
             log_event(events,'compile_finished' if finished else 'compile_checkpoint',
                       completed=completed+new_units,total=total_units)
