@@ -81,3 +81,44 @@ def test_reject_misaligned_slice(tmp_path):
     with GGUFReader(path) as gguf:
         with pytest.raises(ValueError,match='align'):
             gguf.regions(gguf.select(None),0,8,32,128)
+
+
+def test_dotted_model_name_is_not_a_registry():
+    assert model_to_manifest('qwen2.5-coder:3b') == Path(
+        'manifests/registry.ollama.ai/library/qwen2.5-coder/3b')
+    assert model_to_manifest('phi3.5:latest') == Path(
+        'manifests/registry.ollama.ai/library/phi3.5/latest')
+    assert model_to_manifest('registry.ollama.ai/library/qwen2.5-coder:3b') == Path(
+        'manifests/registry.ollama.ai/library/qwen2.5-coder/3b')
+
+
+def test_ollama_show_fallback_without_manifest(tmp_path,monkeypatch):
+    blob=tmp_path/'model.gguf'
+    blob.write_bytes(b'GGUF'+b'fake-content')
+    def show(base, endpoint, body, timeout=30):
+        assert endpoint == '/api/show'
+        assert body == {'model':'qwen2.5-coder:3b'}
+        return {'modelfile':f'FROM {blob}\n'}
+    monkeypatch.setattr('ollama_dag_pipeline.post_json',show)
+    assert resolve_ollama_blob('qwen2.5-coder:3b',str(tmp_path/'missing'),
+                               'http://127.0.0.1:11434') == blob
+
+
+def test_ollama_show_legacy_colon_blob_name(tmp_path,monkeypatch):
+    blob=tmp_path/('sha256-'+'a'*64)
+    blob.write_bytes(b'GGUF')
+    legacy=str(blob).replace('sha256-', 'sha256:')
+    monkeypatch.setattr('ollama_dag_pipeline.post_json',
+        lambda *a,**kw:{'modelfile':f'FROM {legacy}\n'})
+    assert resolve_ollama_blob('qwen2.5-coder:3b',str(tmp_path/'missing'),
+                               'http://127.0.0.1:11434') == blob
+
+
+def test_ollama_show_rejects_non_gguf(tmp_path,monkeypatch):
+    blob=tmp_path/'bad.bin'
+    blob.write_bytes(b'NOT_GGUF')
+    monkeypatch.setattr('ollama_dag_pipeline.post_json',
+        lambda *a,**kw:{'modelfile':f'FROM {blob}\n'})
+    with pytest.raises(FileNotFoundError,match='--gguf'):
+        resolve_ollama_blob('qwen2.5-coder:3b',str(tmp_path/'missing'),
+                            'http://127.0.0.1:11434')
