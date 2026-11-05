@@ -284,7 +284,7 @@ def main(argv=None):
             exp.event('pull_started',model=args.model)
             post_json(args.ollama_url,'/api/pull',{'model':args.model,'stream':True})
             exp.event('pull_completed')
-        gguf=Path(args.gguf) if args.gguf else resolve_ollama_blob(args.model,args.models_dir)
+        gguf=Path(args.gguf) if args.gguf else resolve_ollama_blob(args.model,args.models_dir,args.ollama_url)
         (exp.logs/'prompt.txt').write_text(prompt,encoding='utf-8')
         exp.report['source_gguf']=str(gguf)
         exp.event('baseline_started')
