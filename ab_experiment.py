@@ -212,6 +212,38 @@ def run_generation(exp:Experiment, name:str,base:str,model:str,prompt:str,option
     return result
 
 
+def _latest_compile_event(path: Path):
+    """Read only the tail of progress logs to bound RAM usage."""
+    try:
+        with path.open('rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384), os.SEEK_SET)
+            lines = f.read().splitlines()
+        for line in reversed(lines):
+            try:
+                item = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if item.get('event') in ('compile_started','compile_progress','compile_finished','compile_checkpoint'):
+                return item
+    except OSError:
+        pass
+    return None
+
+
+def _emit_compile_progress(item, elapsed):
+    done = int(item.get('completed', item.get('already_completed', 0)))
+    total = int(item.get('total', item.get('total_units', 0)))
+    duration = float(item.get('elapsed_seconds', elapsed))
+    if total:
+        rate = done/duration if duration > 0 else 0
+        eta = (total-done)/rate/3600 if rate > 0 else None
+        eta_label = f'{eta:.1f}h' if eta is not None else 'unknown'
+        print(f'[DAG CSE] {done:,}/{total:,} ({done/total:.2%}) | {rate:.2f} units/s | ETA {eta_label}', flush=True)
+    else:
+        print('[DAG CSE] compiler active, awaiting first checkpoint',flush=True)
+
+
 def run_compile(exp:Experiment,gguf:Path,args):
     exp.event('compile_started',gguf=str(gguf))
     log=exp.logs/'compile.stdout.log';err=exp.logs/'compile.stderr.log'
@@ -224,11 +256,37 @@ def run_compile(exp:Experiment,gguf:Path,args):
     with log.open('w',encoding='utf-8') as stdout, err.open('w',encoding='utf-8') as stderr:
         process=subprocess.Popen(cmd,stdout=stdout,stderr=stderr)
         with MemoryMonitor(args.interval,target_pid=process.pid) as monitor:
-            exit_code=process.wait()
+            last_print=time.monotonic()
+            last_count=-1
+            try:
+                while True:
+                    try:
+                        returncode=process.wait(timeout=5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        now=time.monotonic()
+                        if now-last_print < 15:
+                            continue
+                        event=_latest_compile_event(exp.out/'compiled'/'compile_events.jsonl')
+                        done=event.get('completed',event.get('already_completed',0)) if event else 0
+                        if event and (done != last_count or now-last_print >= 30):
+                            _emit_compile_progress(event,now-start)
+                            last_count=done
+                        elif now-last_print >= 30:
+                            print('[DAG CSE] compiler active; awaiting next checkpoint',flush=True)
+                        last_print=now
+            except KeyboardInterrupt:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
     summary_path=exp.out/'compiled'/'full_model_report.json'
     data=json.loads(summary_path.read_text(encoding='utf-8')) if summary_path.exists() else {}
-    info={'status':'completed' if exit_code==0 else 'failed',
-          'returncode':exit_code,'wall_seconds':round(time.monotonic()-start,3),
+    info={'status':'completed' if returncode==0 else 'failed',
+          'returncode':returncode,'wall_seconds':round(time.monotonic()-start,3),
           'compiler_report':data,'host_memory_during_compile':monitor.summary(),
           'stdout_path':str(log),'stderr_path':str(err)}
     with (exp.logs/'compile.memory.jsonl').open('w',encoding='utf-8') as f:
@@ -320,6 +378,10 @@ def main(argv=None):
                 'optimized_runtime_reported_model_vram_bytes':(optimized.get('ollama_model_residency') or {}).get('size_vram'),
                 'note':'Same prompt and decode options; full numerical/logits equivalence NOT established merely by matching text.'}
             exp.report['status']='ab_completed'
+    except KeyboardInterrupt:
+        exp.report['status']='interrupted'
+        exp.report['error']='Interrupted. Compiler checkpoint retained for resume.'
+        exp.event('experiment_interrupted')
     except Exception as exc:
         exp.report['status']='failed'
         exp.report['error']=str(exc)
@@ -329,6 +391,8 @@ def main(argv=None):
         exp.save()
         print(json.dumps({'status':exp.report['status'],'report':str(exp.path),
               'phases':list(exp.report['phases'])},indent=2))
+    if exp.report['status']=='interrupted':
+        return 130
     if exp.report['status'] in ('failed','compile_failed'):
         return 1
     if exp.report['status']!='ab_completed':

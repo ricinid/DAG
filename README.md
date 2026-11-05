@@ -170,3 +170,12 @@ The model file must be accessible on the machine running the compiler.
 Use a fresh `--out-dir` for each experiment: reports are not overwritten.
 
 After `git pull`, rerun without `--pull` if the model is already installed.
+
+
+## CSE acceleration (v0.5)
+
+The greedy CSE candidate search now uses the cached Numba JIT in `cse_accelerator.py` when installed. Its compact open-addressing table preserves the original **pair-window occurrences**, first-seen tie-breaking and NAF cost model. The DAG and `.adagstream` format are unchanged, and the existing compiler checkpoint can be resumed.
+
+Set `$env:DAG_CSE_ENGINE = 'python'` to force the reference implementation or `'numba'` to require JIT. The default is `'auto'`. First Numba invocation incurs a JIT startup cost. Run `python bench_cse.py --repeat 50 --out dag_results/cse_benchmark.json` to measure CSE-only speedup on this computer. Results on synthetic tiles do not establish full-model RAM/VRAM savings.
+
+The A/B orchestrator now prints periodic compiler progress and ETA. `Ctrl+C` terminates its child compiler, leaving the already committed index and stream resumable using `whole_model_dag.py` with the **same source GGUF and compiler options**. The original inference A/B remains blocked until an executable DAG runtime exists.

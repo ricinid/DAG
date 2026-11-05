@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from math import gcd
@@ -31,6 +32,8 @@ from time import perf_counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+from cse_accelerator import NUMBA_AVAILABLE, extract_numba
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,8 @@ def _canonical_pair(a: int, b: int, ca: int, cb: int):
 
 
 def extract_shared_expressions(w: np.ndarray, max_nodes: int = 16,
-                               pair_window: int = 4, min_gain: int = 1) -> LocalDAG:
+                               pair_window: int = 4, min_gain: int = 1,
+                               engine: str = 'auto') -> LocalDAG:
     """Greedy multioutput pair CSE, before shift-add lowering. Exact for Z.
 
     Bounded pair window / max nodes deliberately make this a heuristic, not an
@@ -82,6 +86,16 @@ def extract_shared_expressions(w: np.ndarray, max_nodes: int = 16,
         raise TypeError('W must be a rank-2 integer matrix')
     if w.size and (w.min() < -8 or w.max() > 7):
         raise ValueError('Only signed INT4 coefficients [-8, 7] are supported')
+    if engine == 'auto':
+        engine = os.environ.get('DAG_CSE_ENGINE', 'auto').strip().lower()
+    if engine not in ('auto', 'python', 'numba'):
+        raise ValueError(f'Unknown CSE engine: {engine!r}')
+    use_numba = engine == 'numba' or (engine == 'auto' and NUMBA_AVAILABLE)
+    if use_numba:
+        node_table, coeff_table = extract_numba(w, max_nodes, pair_window, min_gain)
+        nodes = [Node(*map(int, record)) for record in node_table]
+        rows = [{j: int(c) for j, c in enumerate(row) if c} for row in coeff_table]
+        return LocalDAG(w.shape[1], nodes, rows)
     m, n = w.shape
     rows = [{j: int(c) for j, c in enumerate(w[i]) if c} for i in range(m)]
     nodes: List[Node] = []
