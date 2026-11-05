@@ -10,6 +10,7 @@ from test_ollama_dag_pipeline import fake_gguf
 
 
 class FakeOllama(BaseHTTPRequestHandler):
+    model_blob_path = None
     def log_message(self,fmt,*args):
         pass
     def do_GET(self):
@@ -21,6 +22,11 @@ class FakeOllama(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(blob)
     def do_POST(self):
         n=int(self.headers['Content-Length']);request=json.loads(self.rfile.read(n))
+        if self.path=='/api/show':
+            if not self.model_blob_path: self.send_error(404); return
+            blob=json.dumps({'modelfile':f'FROM {self.model_blob_path}\n'}).encode()
+            self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers()
+            self.wfile.write(blob); return
         if self.path!='/api/generate':self.send_error(404);return
         self.send_response(200);self.send_header('Content-Type','application/x-ndjson');self.end_headers()
         if request.get('keep_alive')==0:
@@ -34,6 +40,7 @@ class FakeOllama(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_ollama():
+    FakeOllama.model_blob_path = None
     server=ThreadingHTTPServer(('127.0.0.1',0),FakeOllama)
     thread=threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
@@ -41,6 +48,7 @@ def fake_ollama():
         yield f'http://127.0.0.1:{server.server_port}'
     finally:
         server.shutdown(); server.server_close();thread.join(timeout=2)
+        FakeOllama.model_blob_path = None
 
 
 def test_streamed_generation(fake_ollama):
@@ -76,3 +84,20 @@ def test_ab_rejects_partial_compiler(tmp_path,fake_ollama):
               '--rows','2','--cols','256','--max-work-units','1','--max-nodes','1','--interval','.1'])
     assert ret==2
     assert json.loads((out/'ab_report.json').read_text())['status']=='compile_incomplete'
+
+
+def test_whole_model_ab_resolves_blob_via_ollama_show(tmp_path,fake_ollama):
+    src,_=fake_gguf(tmp_path,2,rows=2,cols=256)
+    FakeOllama.model_blob_path=str(src)
+    out=tmp_path/'resolved_by_show'
+    rc=main(['--model','qwen2.5-coder:3b',
+             '--ollama-url',fake_ollama,
+             '--models-dir',str(tmp_path/'missing_models'),
+             '--out-dir',str(out),'--rows','2','--cols','256',
+             '--max-nodes','1','--interval','.1'])
+    assert rc==2  # Compilation succeeded, but true DAG inference is not integrated.
+    report=json.loads((out/'ab_report.json').read_text())
+    assert report['source_gguf']==str(src)
+    assert report['phases']['baseline']['status']=='completed'
+    assert report['phases']['compile']['status']=='completed'
+    assert report['status']=='blocked_no_dag_inference_runtime'
