@@ -89,7 +89,8 @@ def model_to_manifest(model: str) -> Path:
     parts = base.split('/')
     if not base or any(p in ('', '.', '..') for p in parts) or '/' in tag or tag in ('', '.', '..'):
         raise ValueError('Invalid model or tag')
-    if '.' in parts[0] or ':' in parts[0]:
+    # A version dot in qwen2.5-coder is not a registry hostname.
+    if len(parts) > 1 and ('.' in parts[0] or ':' in parts[0]):
         registry = parts.pop(0)
     else:
         registry = 'registry.ollama.ai'
