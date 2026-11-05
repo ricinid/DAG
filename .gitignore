@@ -8,3 +8,9 @@ __pycache__/
 *.pyc
 dag_results/
 .venv/
+*.adagstream
+*.index.jsonl
+*.log
+full_model_report.json
+ab_report.json
+compiler_state.json
