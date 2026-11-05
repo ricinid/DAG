@@ -78,7 +78,7 @@ RSS of detected Ollama processes, system RAM usage, and `nvidia-smi` per-GPU
 system-wide VRAM usage at the monitor's sampling interval. Global GPU usage
 includes other processes. Client-observed TTFT and Ollama's generation timing
 are both captured. A monitor sampling process can miss very short peaks.
-`compile` records system RAM/VRAM during the separate compiler subprocess;
+`compile` records the peak RSS of the compiler process tree plus system RAM/VRAM during the separate compiler subprocess;
 this is not optimized inference memory. For the original CUDA allocator slice
 microbenchmarks see `README_ollama_dag.md`.
 

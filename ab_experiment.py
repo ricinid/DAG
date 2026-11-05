@@ -49,8 +49,9 @@ class MemoryMonitor:
     Global Nvidia memory is *not* per-model VRAM: measurements include unrelated
     GPU processes. Ollama /api/ps provides per-loaded-model size_vram separately.
     """
-    def __init__(self, interval: float = .4):
+    def __init__(self, interval: float = .4, target_pid: int | None = None):
         self.interval=interval
+        self.target_pid=target_pid
         self.samples=[]
         self._stop=threading.Event()
         self._thread=None
@@ -67,10 +68,19 @@ class MemoryMonitor:
                     ollama_rss+=p.info['memory_info'].rss
             except (psutil.AccessDenied,psutil.NoSuchProcess,TypeError):
                 continue
+        target_rss=None
+        if self.target_pid is not None:
+            try:
+                proc=psutil.Process(self.target_pid)
+                members=[proc]+proc.children(recursive=True)
+                target_rss=sum(p.memory_info().rss for p in members if p.is_running())
+            except (psutil.AccessDenied,psutil.NoSuchProcess,psutil.ZombieProcess):
+                pass
         item={'elapsed_s':round(time.monotonic()-self.start,3),
               'system_used_ram_bytes':int(vm.used),
               'system_available_ram_bytes':int(vm.available),
-              'ollama_process_rss_bytes':int(ollama_rss)}
+              'ollama_process_rss_bytes':int(ollama_rss),
+              'target_process_tree_rss_bytes':target_rss}
         if self.nvidia:
             try:
                 p=subprocess.run([self.nvidia,'--query-gpu=index,memory.used,memory.total',
@@ -118,6 +128,8 @@ class MemoryMonitor:
                 per_gpu[ix]['peak_mib']=max(per_gpu[ix]['peak_mib'],gpu['used_mib'])
         for g in per_gpu.values():
             g['increase_mib']=max(0,g['peak_mib']-g['initial_mib'])
+        targets=[s['target_process_tree_rss_bytes'] for s in self.samples if s.get('target_process_tree_rss_bytes') is not None]
+        if targets:out['peak_target_process_tree_rss_bytes']=max(targets)
         out['nvidia_system_vram_mib_by_gpu']=per_gpu
         out['vram_note']='Global device usage (other processes included), not allocated GPU memory exclusively for this model.'
         return out
@@ -209,12 +221,14 @@ def run_compile(exp:Experiment,gguf:Path,args):
          '--max-nodes',str(args.max_nodes)]
     if args.max_work_units is not None:cmd.extend(['--max-work-units',str(args.max_work_units)])
     start=time.monotonic()
-    with log.open('w',encoding='utf-8') as stdout, err.open('w',encoding='utf-8') as stderr, MemoryMonitor(args.interval) as monitor:
-        result=subprocess.run(cmd,stdout=stdout,stderr=stderr,check=False)
+    with log.open('w',encoding='utf-8') as stdout, err.open('w',encoding='utf-8') as stderr:
+        process=subprocess.Popen(cmd,stdout=stdout,stderr=stderr)
+        with MemoryMonitor(args.interval,target_pid=process.pid) as monitor:
+            exit_code=process.wait()
     summary_path=exp.out/'compiled'/'full_model_report.json'
     data=json.loads(summary_path.read_text(encoding='utf-8')) if summary_path.exists() else {}
-    info={'status':'completed' if result.returncode==0 else 'failed',
-          'returncode':result.returncode,'wall_seconds':round(time.monotonic()-start,3),
+    info={'status':'completed' if exit_code==0 else 'failed',
+          'returncode':exit_code,'wall_seconds':round(time.monotonic()-start,3),
           'compiler_report':data,'host_memory_during_compile':monitor.summary(),
           'stdout_path':str(log),'stderr_path':str(err)}
     with (exp.logs/'compile.memory.jsonl').open('w',encoding='utf-8') as f:
