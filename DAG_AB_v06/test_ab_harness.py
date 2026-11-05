@@ -42,9 +42,8 @@ def test_full_four_stage_harness_and_ratios(tmp_path):
     gguf, _ = fake_gguf(tmp_path, 2, rows=3, cols=256)
     compiled = tmp_path/'compiled'
     compile_full(gguf, compiled, rows=3, cols=256, max_nodes=2)
-    f = tmp_path/'fake-server'
+    f = tmp_path/'fake-server.py'
     f.write_text(FAKE_SERVER)
-    f.chmod(0o755)
     out = tmp_path/'ab'
     assert main(['--server',str(f),'--gguf',str(gguf),'--compiled',str(compiled),
                  '--out-dir',str(out),'--port','19987','--trials','2',
