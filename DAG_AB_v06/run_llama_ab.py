@@ -172,7 +172,12 @@ def phase(mode:str,args,report:dict,source_bytes:int):
         budget = 0 if mode=='resident' else int(source_bytes*FRACTIONS[mode])
         env['DAG_CACHE_BYTES']=str(budget)
     logfile=args.out_dir / (mode+'.server.log')
-    cmd=[str(args.server),'-m',str(args.gguf),'--host','127.0.0.1',
+    # A .py mock server is launched through the active interpreter on every OS.
+    # Production llama-server binaries remain direct executables, so an invalid
+    # native binary still fails rather than silently switching to a mock.
+    server_prefix = ([sys.executable, str(args.server)]
+                     if args.server.suffix.lower() == '.py' else [str(args.server)])
+    cmd=server_prefix+['-m',str(args.gguf),'--host','127.0.0.1',
          '--port',str(args.port),'-t','1','-ngl','0',
          '-c',str(args.ctx),'--parallel','1']
     obj={'status':'started','mode':mode,'cache_budget_bytes':budget,
