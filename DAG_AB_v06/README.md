@@ -232,3 +232,52 @@ benchmark. If the graph trace contains Q4 GEMV operations but there are zero
 DAG calls, compare their name/type/shape/column count against the hook guard.
 If the graph has no Q4 nodes, we must investigate the underlying graph
 construction and weight layout. Provide the complete stream50 server log.
+
+
+## Windows A/B telemetry: first GEMV is not a final counter
+
+The old native runtime logged [DAG native] STATS only after call #1 and
+every 1000 calls, plus an atexit handler. Windows subprocess.Popen.terminate()
+uses TerminateProcess, so atexit does not run. A reported gemv_calls=1,
+cache_hits=0, cache_misses=2752 therefore could be the FIRST snapshot, not
+the entire eight-token inference.
+
+Updated runtime supports DAG_STATS_EVERY, and its JSON records stats_every.
+The Python harness requests a snapshot every GEMV automatically for a
+restricted --dag-tensors list; it uses interval 1000 for --dag-tensors all
+and accepts --dag-stats-every to override. It checks that the C++ runtime
+actually used the requested interval and fails when an outdated DLL is
+loaded. The fields dag_native_stats_sample_interval and
+dag_native_stats_exact_after_completed_trials make this distinction
+machine-readable.
+
+IMPORTANT: git pull does not overwrite the C++ source copied earlier
+into the separate llama-dag checkout. For the already patched Windows tree:
+
+~~~powershell
+git pull --ff-only
+Copy-Item .\DAG_AB_v06\native\dag_runtime.cpp ..\llama-dag\ggml\src\ggml-cpu\dag_runtime.cpp -Force
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_ab_08tokens_statsfix_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --trials 1 --num-predict 8
+$r = Get-Content dag_results\native_ab_08tokens_statsfix_01\full_inference_ab.json -Raw | ConvertFrom-Json
+$r.phases.stream50.dag_native_stats
+$r.phases.stream50.dag_native_stats_exact_after_completed_trials
+~~~
+
+To run the newly added native regression test on Windows, recompile
+DAG_AB_v06/native/dag_native.dll against the updated dag_runtime.cpp
+using MSVC and vcpkg z.lib, as in the Preparation section, before pytest.
+The DLL and llama-server each contain separate compiled native code.
+
+With stats_every=1, the last per-GEMV snapshot includes every completed
+GEMV for finished requests, but LOGGING HAS OVERHEAD and is intended
+for coverage/cache analysis, not final full-model throughput. With
+stats_every>1 on Windows, the logged counters are sampled lower bounds.
+Use a graceful final stats export in later production-quality benchmarking.
+
+Matching token IDs are a smoke check, not full logits parity. The single
+8-token trial reported 5.303 tok/s baseline versus 1.815 tok/s DAG:
+~2.92 times slower; more controlled trials are needed to characterize it.
