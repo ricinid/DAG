@@ -35,6 +35,8 @@ class H(BaseHTTPRequestHandler):
   self.wfile.write(b'data: {"content":"","stop":true,"timings":{"predicted_n":2,"predicted_per_second":18,"prompt_n":5,"prompt_per_second":20}}\\n\\n')
   self.wfile.flush()
   if os.environ.get('DAG_STREAM_DIR'):
+   if os.environ.get('DAG_INPUT_SEMANTICS') == 'ggml-q8':
+    print('[DAG q8 normal] tensor=blk.0.ffn_gate.weight quant_type=q8_K call=1',file=sys.stderr,flush=True)
    print('[DAG native] STATS '+json.dumps({'exec_plan':int(os.environ.get('DAG_EXEC_PLAN','0')),'stats_every':int(os.environ.get('DAG_STATS_EVERY','1000')),'gemv_calls':99,'cache_hits':10}),file=sys.stderr,flush=True)
 ThreadingHTTPServer(('127.0.0.1',a.port),H).serve_forever()
 '''
@@ -145,3 +147,42 @@ def test_token_comparison_classifies_divergence_and_missing_capture():
     assert missing.get('same_token_ids') is None
     legacy=compare_token_sequences({'token_ids_sha256':'x'},good([1,2]))
     assert legacy['status']=='unknown'
+
+
+def test_single_pass_q8_mode_report_and_bridge_confirmation(tmp_path):
+    gguf, _ = fake_gguf(tmp_path, 2, rows=3, cols=256)
+    compiled = tmp_path / 'compiled'
+    compile_full(gguf, compiled, rows=3, cols=256, max_nodes=2)
+    fake = tmp_path / 'fake-server.py'
+    fake.write_text(FAKE_SERVER)
+    out = tmp_path / 'ab_ggml_q8'
+    assert main(['--server', str(fake), '--gguf', str(gguf),
+                 '--compiled', str(compiled), '--out-dir', str(out),
+                 '--port', '19990', '--trials', '1',
+                 '--modes', 'baseline', 'stream50', '--dag-execution', 'decoded',
+                 '--dag-input-semantics', 'ggml-q8',
+                 '--dag-tensors', 'blk.0.ffn_gate.weight']) == 0
+    report = json.loads((out/'full_inference_ab.json').read_text())
+    assert report['settings']['dag_input_semantics'] == 'ggml-q8'
+    assert report['phases']['baseline']['dag_q8_bridge_confirmed'] is None
+    assert report['phases']['stream50']['dag_input_semantics'] == 'ggml-q8'
+    assert report['phases']['stream50']['dag_q8_bridge_confirmed'] is True
+    assert report['phases']['stream50']['relative_to_baseline']['same_token_ids_first_trial'] is True
+
+
+def test_ggml_q8_mode_rejects_missing_bridge(tmp_path):
+    gguf, _ = fake_gguf(tmp_path, 2, rows=3, cols=256)
+    compiled = tmp_path / 'compiled'
+    compile_full(gguf, compiled, rows=3, cols=256, max_nodes=2)
+    fake = tmp_path/'old-server.py'
+    fake.write_text(FAKE_SERVER.replace(
+        "print('[DAG q8 normal] tensor=blk.0.ffn_gate.weight quant_type=q8_K call=1',file=sys.stderr,flush=True)",
+        "pass"))
+    out = tmp_path/'ab_q8_missing'
+    assert main(['--server',str(fake),'--gguf',str(gguf),
+                 '--compiled',str(compiled),'--out-dir',str(out),
+                 '--port','19991','--trials','1','--modes','stream50',
+                 '--dag-tensors','blk.0.ffn_gate.weight',
+                 '--dag-input-semantics','ggml-q8']) == 1
+    result=json.loads((out/'full_inference_ab.json').read_text())
+    assert 'ggml-q8 requested but single-pass GGML bridge did not run' in result['phases']['stream50']['error']
