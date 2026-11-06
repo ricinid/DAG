@@ -103,11 +103,27 @@ struct Tensor {
     uint64_t area = 0;
     uint32_t rows = 0, cols = 0;
 };
+// Prevalidated host-native arithmetic instructions, opt-in.
+struct PlanNode { uint32_t a, b; int32_t ca, cb; };
+struct PlanTerm { uint32_t id; int32_t coeff; };
+struct PlanRow { uint32_t first_term, count; double scale, offset; };
+struct PlanGroup { uint32_t first_node, count, first_row, col; };
 struct Unit {
     uint32_t dtype = 0, rows = 0, cols = 0;
     std::vector<uint8_t> meta;
     std::vector<uint8_t> dags;
-    size_t bytes() const { return meta.capacity() + dags.capacity() + sizeof(Unit); }
+    std::vector<PlanNode> plan_nodes;
+    std::vector<PlanTerm> plan_terms;
+    std::vector<PlanRow> plan_rows;
+    std::vector<PlanGroup> plan_groups;
+    bool planned = false;
+    size_t bytes() const {
+        return sizeof(Unit) + meta.capacity() + dags.capacity() +
+               plan_nodes.capacity()*sizeof(PlanNode) +
+               plan_terms.capacity()*sizeof(PlanTerm) +
+               plan_rows.capacity()*sizeof(PlanRow) +
+               plan_groups.capacity()*sizeof(PlanGroup);
+    }
 };
 std::vector<uint8_t> zip_field(const uint8_t * p, size_t n, const std::string & want) {
     size_t k = 0;
@@ -174,6 +190,11 @@ struct Cursor {
 class Engine {
 public:
     explicit Engine(const std::string & dir, uint64_t budget):budget_(budget) {
+        if (const char * plan = std::getenv("DAG_EXEC_PLAN")) {
+            if (std::strcmp(plan, "1") == 0) exec_plan_ = true;
+            else if (std::strcmp(plan, "0") != 0)
+                throw std::runtime_error("DAG_EXEC_PLAN must be 0 or 1");
+        }
         // Production snapshots are intentionally sparse. Targeted A/B smoke tests
         // request every GEMV because Windows TerminateProcess bypasses atexit.
         if (const char * setting = std::getenv("DAG_STATS_EVERY")) {
@@ -260,7 +281,8 @@ public:
     }
     std::string stats() const {
         std::ostringstream out;
-        out << "{\"stats_every\":" << stats_every_ << ",\"gemv_calls\":" << matvecs_ << ",\"cache_hits\":" << hits_ <<
+        out << "{\"exec_plan\":" << (exec_plan_ ? 1 : 0) <<
+               ",\"stats_every\":" << stats_every_ << ",\"gemv_calls\":" << matvecs_ << ",\"cache_hits\":" << hits_ <<
                ",\"cache_misses\":" << misses_ << ",\"stream_bytes_read\":" << read_bytes_ <<
                ",\"cache_payload_bytes\":" << cache_used_ << ",\"cache_budget_bytes\":" << budget_ <<
                ",\"gemv_first_ns\":" << gemv_first_ns_ <<
@@ -278,7 +300,8 @@ public:
         return out.str();
     }
 private:
-    uint64_t budget_; uint64_t stats_every_ = 1000; std::FILE * file_ = nullptr;
+    uint64_t budget_; uint64_t stats_every_ = 1000; bool exec_plan_ = false;
+    std::FILE * file_ = nullptr;
     std::unordered_map<std::string, Tensor> tensors_;
     std::list<std::pair<uint64_t,std::shared_ptr<Unit>>> cache_;
     std::unordered_map<uint64_t,decltype(cache_)::iterator> lookup_;
@@ -324,6 +347,7 @@ private:
         auto deflated=zip_field(zip.data(),zip.size(),"dags.bin");
         u->dags=inflate_bytes(deflated.data(),deflated.size(),MAX_WBITS);
         if (u->dags.size()>kMaxInflatedBytes) throw std::runtime_error("Large DAG");
+        if (exec_plan_) compile_plan(*u);
         auto extra = u->bytes();
         if ((!budget_ || extra<=budget_)) {
             while (budget_ && !cache_.empty() && cache_used_ + extra > budget_) {
@@ -340,7 +364,84 @@ private:
         unit_materialize_total_ns_ += elapsed_ns(read_end, DagClock::now());
         return u;
     }
+    // Validate references once during cache population and discard bytecode
+    // and quant headers. Same FP64 accumulation order as the legacy interpreter.
+    static void compile_plan(Unit & u) {
+        const uint32_t header_len = u.dtype == 2 ? 2 : 16;
+        const uint32_t qblock = u.dtype == 2 ? 32 : 256;
+        if (u.cols % qblock != 0) throw std::runtime_error("Unaligned unit width");
+        const uint32_t blocks = u.cols / qblock, groups = u.cols / 32;
+        if (u.meta.size() != size_t(u.rows) * blocks * header_len)
+            throw std::runtime_error("Metadata size mismatch");
+        Cursor cur(u.dags);
+        if (cur.get32() != groups) throw std::runtime_error("Wrong DAG group count");
+        for (uint32_t g = 0; g < groups; ++g) {
+            auto length = cur.get32(); cur.checksize(length);
+            const uint8_t * group_end = cur.p + length;
+            const uint32_t inputs = cur.get32(), outputs = cur.get32(), nodes = cur.get32();
+            if (inputs != 32 || outputs != u.rows || nodes > 4096)
+                throw std::runtime_error("Invalid DAG header");
+            PlanGroup group{static_cast<uint32_t>(u.plan_nodes.size()), nodes,
+                            static_cast<uint32_t>(u.plan_rows.size()), g*32};
+            for (uint32_t j = 0; j < nodes; ++j) {
+                const uint32_t a=cur.get32(), b=cur.get32();
+                const int32_t ca=cur.geti32(), cb=cur.geti32();
+                if (a>=inputs+j || b>=inputs+j)
+                    throw std::runtime_error("Non-topological DAG");
+                u.plan_nodes.push_back({a,b,ca,cb});
+            }
+            for (uint32_t rr = 0; rr < u.rows; ++rr) {
+                const uint32_t nt=cur.get32();
+                if (nt>10240) throw std::runtime_error("Output term count unreasonable");
+                const uint32_t first=static_cast<uint32_t>(u.plan_terms.size());
+                for (uint32_t term=0; term<nt; ++term) {
+                    const uint32_t id=cur.get32();
+                    const int32_t coeff=cur.geti32();
+                    if (id>=inputs+nodes) throw std::runtime_error("Invalid output reference");
+                    u.plan_terms.push_back({id,coeff});
+                }
+                const uint32_t b=g/(qblock/32), local=g%(qblock/32);
+                const uint8_t * hdr=&u.meta[(rr*blocks+b)*header_len];
+                double scale, offset;
+                scale_offset(hdr,u.dtype,local,scale,offset);
+                u.plan_rows.push_back({first,nt,scale,offset});
+            }
+            if (cur.p != group_end) throw std::runtime_error("DAG group length mismatch");
+            u.plan_groups.push_back(group);
+        }
+        if (cur.p != cur.end) throw std::runtime_error("Trailing DAG bytes");
+        u.planned = true;
+        std::vector<uint8_t>().swap(u.meta);
+        std::vector<uint8_t>().swap(u.dags);
+    }
+    static void execute_plan(const Unit & u, const Record & r,
+                             const float * x, std::vector<double> & y) {
+        std::vector<double> values;
+        for (const PlanGroup & group : u.plan_groups) {
+            values.resize(32 + group.count);
+            double sx=0.;
+            for (uint32_t i=0; i<32; ++i) {
+                const double v=x[r.col+group.col+i];
+                values[i]=v; sx+=v;
+            }
+            const PlanNode * nodes=u.plan_nodes.data()+group.first_node;
+            for (uint32_t j=0; j<group.count; ++j) {
+                const auto & nd=nodes[j];
+                values[32+j]=double(nd.ca)*values[nd.a]+double(nd.cb)*values[nd.b];
+            }
+            const PlanRow * rows=u.plan_rows.data()+group.first_row;
+            for (uint32_t rr=0; rr<u.rows; ++rr) {
+                const PlanRow & row=rows[rr];
+                const PlanTerm * terms=u.plan_terms.data()+row.first_term;
+                double value=0.;
+                for (uint32_t i=0; i<row.count; ++i)
+                    value+=double(terms[i].coeff)*values[terms[i].id];
+                y[r.row+rr]+=row.scale*value+row.offset*sx;
+            }
+        }
+    }
     static void execute(const Unit & u, const Record & r, const float * x, std::vector<double> & y) {
+        if (u.planned) { execute_plan(u,r,x,y); return; }
         const uint32_t header_len = u.dtype == 2 ? 2 : 16;
         const uint32_t qblock = u.dtype == 2 ? 32 : 256;
         if (u.cols % qblock != 0) throw std::runtime_error("Unaligned unit width");
