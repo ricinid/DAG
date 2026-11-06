@@ -281,3 +281,64 @@ Use a graceful final stats export in later production-quality benchmarking.
 Matching token IDs are a smoke check, not full logits parity. The single
 8-token trial reported 5.303 tok/s baseline versus 1.815 tok/s DAG:
 ~2.92 times slower; more controlled trials are needed to characterize it.
+
+
+## Cold vs warm DAG GEMV native profiling
+
+The first real 8-token Qwen smoke produced baseline 4.982 tok/s vs
+DAG stream50 1.614 tok/s (~3.09x slower). Correctly instrumented native
+stats showed 7 GEMV calls, 2752 cache misses and 16512 hits, exactly
+six complete warm revisits of 2752 records after one cold load.
+The 34.58 MB stream read and ~191.8 MB decoded cache therefore cannot
+explain EVERY warm GEMV's latency. Profile interpreter execution.
+
+The C++ native runtime now reports these cumulative steady-clock
+nanosecond fields in [DAG native] STATS:
+
+- gemv_first_ns: first complete (cold) GEMV.
+- gemv_last_ns / gemv_last_load_ns / gemv_last_execute_ns:
+  most recent complete GEMV broken down into load() and execute().
+- gemv_warm_calls / gemv_warm_total_ns: completed GEMVs where no
+  cache miss occurred; divide to get average warm GEMV duration.
+- gemv_cold_calls: GEMVs with one or more cache misses.
+- gemv_total_ns, gemv_load_total_ns, gemv_execute_total_ns:
+  cumulative full GEMV / cache lookup + materialize / IR arithmetic.
+- stream_io_total_ns: seek and fread only, excluding decompression.
+- unit_materialize_total_ns: ZIP/IR inflation, parsing and cache
+  population on cache misses.
+
+Times exclude the native STATS fprintf calls, but profiling still
+changes hot-path overhead. For accurate production throughput, compare
+against an uninstrumented Release build after choosing optimizations.
+
+Windows: install this new C++ source into the separate patched llama-dag,
+then rebuild. It is NOT enough to git pull the DAG repository.
+
+~~~powershell
+git pull --ff-only
+Copy-Item .\DAG_AB_v06\native\dag_runtime.cpp ..\llama-dag\ggml\src\ggml-cpu\dag_runtime.cpp -Force
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_profile_08_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --trials 1 --num-predict 8
+$r = Get-Content dag_results\native_profile_08_01\full_inference_ab.json -Raw | ConvertFrom-Json
+$s = $r.phases.stream50.dag_native_stats
+[PSCustomObject]@{
+  GemvCalls = $s.gemv_calls
+  ColdCalls = $s.gemv_cold_calls
+  WarmCalls = $s.gemv_warm_calls
+  ColdFirstMs = [math]::Round($s.gemv_first_ns / 1e6, 2)
+  WarmAvgMs = if ($s.gemv_warm_calls) { [math]::Round($s.gemv_warm_total_ns / $s.gemv_warm_calls / 1e6, 2) } else { $null }
+  LastExecuteMs = [math]::Round($s.gemv_last_execute_ns / 1e6, 2)
+  LastLoadMs = [math]::Round($s.gemv_last_load_ns / 1e6, 2)
+  ColdIOms = [math]::Round($s.stream_io_total_ns / 1e6, 2)
+  ColdMaterializeMs = [math]::Round($s.unit_materialize_total_ns / 1e6, 2)
+}
+~~~
+
+Interpretation: a high warm LastExecuteMs or warm average points to IR
+interpretation/arithmetic, while cold-only read/materialize costs point
+to ZIP packaging or cache fill. Do not infer logits parity from a
+matching generated string. The current streaming experiment retains
+the original GGUF in process memory and cannot establish VRAM savings.
