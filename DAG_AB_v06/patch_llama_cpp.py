@@ -12,6 +12,12 @@ from pathlib import Path
 SENTINEL = "// DAG_NATIVE_EXPERIMENTAL_GEMV_HOOK"
 HEADER = '''\n#ifdef GGML_DAG_RUNTIME\n#include "dag_runtime.h"\n#endif\n'''
 HOOK = '''\n#ifdef GGML_DAG_RUNTIME
+    // DAG_NATIVE_EARLY_MUL_MAT_DISPATCH
+    // Intercept before ggml_cpu_extra_compute_forward (CPU_REPACK etc.).
+    if (tensor->op == GGML_OP_MUL_MAT) {
+        const struct ggml_tensor * src0 = tensor->src[0];
+        const struct ggml_tensor * src1 = tensor->src[1];
+        struct ggml_tensor * dst = tensor;
     // DAG_NATIVE_EXPERIMENTAL_GEMV_HOOK
     // Only contiguous CPU F32 GEMV (batch=1, one thread). Unsupported tensor
     // types/shapes use the existing GGML path unchanged. No GPU offload here.
@@ -28,6 +34,7 @@ HOOK = '''\n#ifdef GGML_DAG_RUNTIME
                               (float *) dst->data, (uint64_t) src0->ne[1])) {
             return;
         }
+    }
     }
 #endif
 '''
@@ -51,18 +58,18 @@ def patch(root: Path) -> dict:
     cmake_text = cmake.read_text(encoding='utf-8')
     if SENTINEL in cpu_text:
         raise ValueError('Already patched: do not inject this hook twice')
-    anchor = '''    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    const int32_t hint = ggml_get_op_params_i32(dst, 1);'''
+    anchor = '''    // extra_buffer op?
+    if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        return;
+    }'''
     if cpu_text.count(anchor) != 1:
-        raise RuntimeError('ggml-cpu.c changed: could not safely find MUL_MAT entrypoint')
+        raise RuntimeError('ggml-cpu.c changed: could not safely find early CPU extra-buffer dispatch')
     target = '    target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)'
     if cmake_text.count(target) != 1:
         raise RuntimeError('ggml-cpu CMake signature changed; patch refused')
     if 'GGML_DAG_RUNTIME' in cmake_text:
         raise RuntimeError('Already modified CMake; patch refused')
-    updated_cpu = cpu_text.replace(anchor, anchor.replace('    const int32_t hint',HOOK+'\n    const int32_t hint'))
+    updated_cpu = cpu_text.replace(anchor, HOOK+'\n'+anchor)
     updated_cpu = HEADER + updated_cpu
     updated_cmake = 'option(GGML_DAG_RUNTIME "Experimental streaming DAG CPU GEMV" OFF)\n' + \
         cmake_text.replace(target,CMAKE+'\n'+target)
