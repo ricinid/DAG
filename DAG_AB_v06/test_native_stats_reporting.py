@@ -33,3 +33,18 @@ def test_per_gemv_snapshots_and_cache_hits(tmp_path, monkeypatch, capfd):
     assert all(s['stats_every'] == 1 for s in stats)
     assert stats[0]['cache_misses'] > 0
     assert stats[-1]['cache_hits'] > 0
+    assert stats[0]['gemv_cold_calls'] == 1
+    assert stats[0]['gemv_warm_calls'] == 0
+    assert stats[-1]['gemv_cold_calls'] == 1
+    assert stats[-1]['gemv_warm_calls'] == 2
+    assert stats[-1]['gemv_first_ns'] > 0
+    assert stats[-1]['gemv_last_ns'] > 0
+    assert stats[-1]['gemv_warm_total_ns'] > 0
+    assert stats[-1]['gemv_total_ns'] >= stats[-1]['gemv_warm_total_ns']
+    assert stats[-1]['gemv_execute_total_ns'] > 0
+    assert stats[-1]['gemv_load_total_ns'] > 0
+    assert stats[-1]['stream_io_total_ns'] > 0
+    assert stats[-1]['unit_materialize_total_ns'] > 0
+    assert stats[0]['gemv_warm_total_ns'] == 0
+    assert stats[-1]['gemv_last_execute_ns'] <= stats[-1]['gemv_last_ns']
+    assert stats[-1]['gemv_last_load_ns'] <= stats[-1]['gemv_last_ns']
