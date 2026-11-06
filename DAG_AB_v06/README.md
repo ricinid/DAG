@@ -157,3 +157,42 @@ change computation.
 
 The diagnostic refuses a second installation in the same checkout. This is a
 diagnostic-only experiment, NOT proof of full-model DAG inference or acceleration.
+
+
+## Q4 matrices bypassed by CPU_REPACK: relocate the installed hook
+
+The original v0.6 hook was installed inside ggml_compute_forward_mul_mat().
+However, in pinned llama.cpp ggml_compute_forward() calls
+ggml_cpu_extra_compute_forward() BEFORE dispatching to standard MUL_MAT.
+CPU_REPACK may execute the Q4 matrices on this earlier path. Thus the original
+diagnostic can report only Q6_K fallback matrices and zero DAG GEMV calls.
+
+For an EXISTING checkout where patch_llama_cpp.py and diagnose_hook.py were
+already applied, migrate the installed hook once; DO NOT run patch_llama_cpp.py
+again and DO NOT clone/recompile the existing DAG snapshot.
+
+~~~powershell
+git pull --ff-only
+python -m pytest -q DAG_AB_v06/test_relocate_hook.py DAG_AB_v06/test_hook_install.py
+
+python DAG_AB_v06\relocate_hook.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+
+Select-String ..\llama-dag\ggml\src\ggml-cpu\ggml-cpu.c -Pattern 'DAG_NATIVE_EARLY_MUL_MAT_DISPATCH'
+$env:DAG_HOOK_DIAGNOSTIC = "1"
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_hook_diag_02 --modes stream50 --dag-tensors blk.0.ffn_gate.weight --trials 1 --num-predict 2
+Remove-Item Env:DAG_HOOK_DIAGNOSTIC -ErrorAction SilentlyContinue
+Select-String dag_results\native_hook_diag_02\stream50.server.log -Pattern '\[DAG hook diag\]|\[DAG native\]'
+~~~
+
+The newly updated patch_llama_cpp.py installs the hook directly at the
+EARLY_MUL_MAT dispatch point on future fresh checkouts, before CPU_REPACK.
+The relocation script preserves previously enabled diagnostic instrumentation.
+Supported hook scope remains Q4_0/Q4_K, F32 single-token CPU GEMV at one thread.
+
+If the relocated hook still reports zero calls, provide the full stream50 log.
+The first GGML call can have multiple input columns due to prompt prefill;
+decoding should use a one-column GEMV, but it must be verified in the log.
