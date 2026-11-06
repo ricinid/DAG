@@ -81,7 +81,7 @@ def test_refuses_missing_handled_dag_call(tmp_path):
 def test_rejects_dag_hook_installed_behind_extra_dispatch(tmp_path):
     text = installed_cpu_source()
     text = text.replace(EARLY, "REPLACED")
-    text = text.replace("    // extra_buffer op?", "    // DAG_NATIVE_EARLY_MUL_MAT_DISPATCH\n    // extra_buffer op?")
+    text = text.replace("    // extra_buffer op?", "    // extra_buffer op?\n    // DAG_NATIVE_EARLY_MUL_MAT_DISPATCH")
     path = cpu_file(tmp_path, text)
     with pytest.raises(RuntimeError, match="before CPU"):
         install(tmp_path)
