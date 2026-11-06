@@ -11,10 +11,19 @@ def test_ggml_source_patch_and_reject_double_insertion(tmp_path):
     const struct ggml_tensor * src1 = dst->src[1];
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+}
+static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+    // extra_buffer op?
+    if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        return;
+    }
 }''')
     (p/'CMakeLists.txt').write_text('    target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)')
     patch(tmp_path)
     assert SENTINEL in (p/'ggml-cpu.c').read_text()
+    text = (p/'ggml-cpu.c').read_text()
+    assert text.index('DAG_NATIVE_EARLY_MUL_MAT_DISPATCH') < text.index('ggml_cpu_extra_compute_forward')
+    assert text.count('dag_try_ggml_gemv(') == 1
     assert (p/'dag_runtime.cpp').is_file()
     assert 'find_package(ZLIB REQUIRED)' in (p/'CMakeLists.txt').read_text()
     with pytest.raises(ValueError, match='Already patched'):
