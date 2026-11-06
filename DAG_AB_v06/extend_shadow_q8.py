@@ -72,7 +72,7 @@ if (dag_n_input > 0 && dag_n_input % dag_qblock == 0 &&
                 " reduction=%.9g differing_f32=%zu nonfinite=%zu\n",
                 src0->name, dag_shadow_call, ggml_type_name(dag_qtype),
                 dag_rmse, dag_q8_rmse, dag_q8_max,
-                dag_rmse > 0.0 ? dag_rmse / dag_q8_rmse : 0.0,
+                dag_q8_rmse > 0.0 ? dag_rmse / dag_q8_rmse : (dag_rmse > 0.0 ? HUGE_VAL : 1.0),
                 dag_q8_diff_bits, dag_q8_nonfinite);
             fflush(stderr);
         } else {
