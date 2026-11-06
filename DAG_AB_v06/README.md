@@ -113,3 +113,47 @@ Output: `full_inference_ab.json` (updated after each successful phase), `baselin
 - Measure per-mode peak RAM, VRAM, decode tok/s, TTFT and I/O; confirm memory improvements with elimination of original quantized weight allocation (not yet implemented).
 
 This is a deliberately small, measurable native entry point. A good streaming cache policy cannot compensate for re-reading/decompressing multiple gigabytes of IR on every generated token, so optimize IR and memory traffic **after observing the first real measurements**, not before.
+
+## Troubleshooting: zero DAG GEMV calls on Qwen
+
+The harness correctly rejects a DAG run if no actual DAG GEMV was executed.
+A normal-looking tok/s in this case is NOT evidence of DAG throughput: operations
+may have silently fallen back to GGML. The current hook accepts only one CPU
+thread, Q4_0/Q4_K weights, F32 activations, contiguous single-token GEMV, and
+an exactly matching tensor name.
+
+No need to recompile the DAG snapshot. To inspect the real GGML shapes and types,
+install the one-shot diagnostic into the already patched llama-dag checkout,
+rebuild only llama-server and run a short diagnostic smoke:
+
+~~~powershell
+git pull --ff-only
+Select-String ..\llama-dag\ggml\src\ggml-cpu\ggml-cpu.c -Pattern DAG_NATIVE_EXPERIMENTAL_GEMV_HOOK
+Select-String ..\llama-dag\build-dag\CMakeCache.txt -Pattern '^GGML_DAG_RUNTIME:BOOL=ON'
+
+python DAG_AB_v06\diagnose_hook.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+$env:DAG_HOOK_DIAGNOSTIC = "1"
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_hook_diag_01 --modes stream50 --dag-tensors blk.0.ffn_gate.weight --trials 1 --num-predict 2
+Remove-Item Env:DAG_HOOK_DIAGNOSTIC -ErrorAction SilentlyContinue
+Select-String dag_results\native_hook_diag_01\stream50.server.log -Pattern '\[DAG hook diag\]|\[DAG native\]'
+~~~
+
+The diagnostic prints up to 6 first MUL_MAT calls and 16 FFN-gate operations.
+It reports tensor name, types, threads, shapes and contiguity. It does not
+change computation.
+
+- No [DAG hook diag] lines: confirm the rebuilt CPU backend contains the
+  patched source and GGML_DAG_RUNTIME is ON.
+- Observed src1_type != f32, threads != 1, or multi-token input: the current
+  hook's narrow guard rejects the operation. Do not reinterpret Q8 data as F32.
+- Actual tensor name differs: reconcile it against the DAG index.
+- Shape and type appear eligible but no DAG-native STATS: inspect the allowlist,
+  artifact index and dimension matching before changing kernel semantics.
+
+The diagnostic refuses a second installation in the same checkout. This is a
+diagnostic-only experiment, NOT proof of full-model DAG inference or acceleration.
