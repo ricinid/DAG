@@ -34,7 +34,7 @@ class H(BaseHTTPRequestHandler):
   self.wfile.write(b'data: {"content":"","stop":true,"timings":{"predicted_n":2,"predicted_per_second":18,"prompt_n":5,"prompt_per_second":20}}\\n\\n')
   self.wfile.flush()
   if os.environ.get('DAG_STREAM_DIR'):
-   print('[DAG native] STATS '+json.dumps({'gemv_calls':99,'cache_hits':10}),file=sys.stderr,flush=True)
+   print('[DAG native] STATS '+json.dumps({'stats_every':int(os.environ.get('DAG_STATS_EVERY','1000')),'gemv_calls':99,'cache_hits':10}),file=sys.stderr,flush=True)
 ThreadingHTTPServer(('127.0.0.1',a.port),H).serve_forever()
 '''
 
@@ -48,13 +48,17 @@ def test_full_four_stage_harness_and_ratios(tmp_path):
     out = tmp_path/'ab'
     assert main(['--server',str(f),'--gguf',str(gguf),'--compiled',str(compiled),
                  '--out-dir',str(out),'--port','19987','--trials','2',
-                 '--modes','baseline','stream50','stream25','stream10']) == 0
+                 '--modes','baseline','stream50','stream25','stream10',
+                 '--dag-tensors','blk.0.ffn_gate.weight']) == 0
     report=json.loads((out/'full_inference_ab.json').read_text())
     assert report['status']=='complete'
     assert set(report['phases']) == {'baseline','stream50','stream25','stream10'}
     for mode in ['stream50','stream25','stream10']:
         d=report['phases'][mode]
         assert d['dag_native_stats']['gemv_calls']==99
+        assert d['dag_native_stats']['stats_every']==1
+        assert d['dag_native_stats_sample_interval']==1
+        assert d['dag_native_stats_exact_after_completed_trials'] is True
         assert d['relative_to_baseline']['same_token_ids_first_trial']
     assert report['phases']['stream50']['cache_budget_bytes']==gguf.stat().st_size//2
     assert report['phases']['stream10']['cache_budget_bytes']==int(gguf.stat().st_size*.1)
