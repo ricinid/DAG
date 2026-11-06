@@ -196,3 +196,39 @@ Supported hook scope remains Q4_0/Q4_K, F32 single-token CPU GEMV at one thread.
 If the relocated hook still reports zero calls, provide the full stream50 log.
 The first GGML call can have multiple input columns due to prompt prefill;
 decoding should use a one-column GEMV, but it must be verified in the log.
+
+
+## Second diagnostic: no Q4/FFN gate even after early hook relocation
+
+If the bounded hook diagnostics continue to show only Q6_K operations after
+relocate_hook.py, do not infer that the Q4 tensors are missing. The original
+diagnostic logs only the first 6 *non-ffn_gate* MUL_MAT operations, while the
+graph can contain other operations, tensor aliases and specialized dispatch.
+
+The pre-dispatch graph trace runs at ggml_graph_compute_thread(), *before*
+both CPU_REPACK and fused execution. It prints at most 16 FFN-gate graph
+nodes, 16 Q4 nodes and 4 GLU nodes. It is enabled only with
+DAG_HOOK_DIAGNOSTIC=1 and an active DAG_STREAM_DIR.
+
+For an already relocated and built llama-dag checkout:
+
+~~~powershell
+git pull --ff-only
+python -m pytest -q DAG_AB_v06/test_graph_ops_trace.py
+python DAG_AB_v06\trace_graph_ops.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+$env:DAG_HOOK_DIAGNOSTIC = "1"
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_graph_diag_03 --modes stream50 --dag-tensors blk.0.ffn_gate.weight --trials 1 --num-predict 2
+Remove-Item Env:DAG_HOOK_DIAGNOSTIC -ErrorAction SilentlyContinue
+Select-String dag_results\native_graph_diag_03\stream50.server.log -Pattern '\[DAG graph diag\]|\[DAG hook diag\]|\[DAG native\]'
+~~~
+
+A nonzero DAG GEMV counter is still required. This is not a throughput
+benchmark. If the graph trace contains Q4 GEMV operations but there are zero
+DAG calls, compare their name/type/shape/column count against the hook guard.
+If the graph has no Q4 nodes, we must investigate the underlying graph
+construction and weight layout. Provide the complete stream50 server log.
