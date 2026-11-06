@@ -169,6 +169,16 @@ struct Cursor {
 class Engine {
 public:
     explicit Engine(const std::string & dir, uint64_t budget):budget_(budget) {
+        // Production snapshots are intentionally sparse. Targeted A/B smoke tests
+        // request every GEMV because Windows TerminateProcess bypasses atexit.
+        if (const char * setting = std::getenv("DAG_STATS_EVERY")) {
+            char * end = nullptr;
+            errno = 0;
+            auto parsed = std::strtoull(setting, &end, 10);
+            if (!*setting || end == setting || *end != '\0' || errno == ERANGE || parsed == 0)
+                throw std::runtime_error("DAG_STATS_EVERY must be a positive integer");
+            stats_every_ = static_cast<uint64_t>(parsed);
+        }
         auto path = dir + "/weights.index.jsonl";
         std::ifstream index(path);
         if (!index) throw std::runtime_error("Cannot open " + path);
@@ -212,7 +222,7 @@ public:
             }
             for (size_t i=0;i<m;i++) y[i]=static_cast<float>(accum[i]);
             ++matvecs_;
-            if (matvecs_ == 1 || matvecs_ % 1000 == 0) {
+            if (matvecs_ == 1 || matvecs_ % stats_every_ == 0) {
                 std::fprintf(stderr,"[DAG native] STATS %s\n",stats().c_str());
                 std::fflush(stderr);
             }
@@ -223,13 +233,13 @@ public:
     }
     std::string stats() const {
         std::ostringstream out;
-        out << "{\"gemv_calls\":" << matvecs_ << ",\"cache_hits\":" << hits_ <<
+        out << "{\"stats_every\":" << stats_every_ << ",\"gemv_calls\":" << matvecs_ << ",\"cache_hits\":" << hits_ <<
                ",\"cache_misses\":" << misses_ << ",\"stream_bytes_read\":" << read_bytes_ <<
                ",\"cache_payload_bytes\":" << cache_used_ << ",\"cache_budget_bytes\":" << budget_ << "}";
         return out.str();
     }
 private:
-    uint64_t budget_; std::FILE * file_ = nullptr;
+    uint64_t budget_; uint64_t stats_every_ = 1000; std::FILE * file_ = nullptr;
     std::unordered_map<std::string, Tensor> tensors_;
     std::list<std::pair<uint64_t,std::shared_ptr<Unit>>> cache_;
     std::unordered_map<uint64_t,decltype(cache_)::iterator> lookup_;
