@@ -342,3 +342,74 @@ interpretation/arithmetic, while cold-only read/materialize costs point
 to ZIP packaging or cache fill. Do not infer logits parity from a
 matching generated string. The current streaming experiment retains
 the original GGUF in process memory and cannot establish VRAM savings.
+
+
+## v0.6 warm-execution experiment: predecoded DAG plan (opt-in)
+
+Measured on the Windows Qwen single-tensor, eight-token experiment:
+
+- Baseline 5.159 tok/s vs raw DAG 1.696 tok/s (~3.04x slower).
+- 7 DAG GEMVs: 1 cold / 6 warm; 2752 misses / 16512 hits.
+- Cold first GEMV 763.53 ms; warm average 81.56 ms.
+- Last warm GEMV: 80.47 ms execute() versus 1.18 ms load().
+- First call's materialization 648.12 ms, stream I/O 38.26 ms.
+
+These observations justify first optimizing repeated bytecode parsing and
+execution, not rewriting the stream format or cache replacement blindly.
+
+An experimental predecoded execution plan is now available. DAG_EXEC_PLAN=1
+validates and transforms the DAG bytes on cache fill into native arrays of
+nodes, terms, rows (with precomputed scale/offset) and groups. It discards
+the original bytecode and quant headers after decoding, then executes
+the plan in the original double-precision accumulation order. This changes
+RAM footprint and cold decode cost, so it is DISABLED BY DEFAULT.
+DAG_EXEC_PLAN=0 retains the previously validated interpreter.
+
+The Python A/B harness accepts --dag-execution raw|decoded and checks the
+runtime's exec_plan field. Existing C++ libraries must be recompiled
+before the new tests or --dag-execution decoded can work. The synthetic
+Q4_0/Q4_K regression asserts exact output bit-pattern parity between
+raw and decoded modes over rows and cache budgets.
+
+For a targeted raw-vs-decoded experiment, reuse the existing compiled
+model. No need to rerun whole_model_dag.py or CSE:
+
+~~~powershell
+git pull --ff-only
+Copy-Item .\DAG_AB_v06\native\dag_runtime.cpp ..\llama-dag\ggml\src\ggml-cpu\dag_runtime.cpp -Force
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_predecoded_08_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --trials 1 --num-predict 8
+
+$r = Get-Content dag_results\native_predecoded_08_01\full_inference_ab.json -Raw | ConvertFrom-Json
+$s = $r.phases.stream50.dag_native_stats
+[PSCustomObject]@{
+  BaselineTPS = $r.phases.baseline.median_decode_tps
+  PlanTPS = $r.phases.stream50.median_decode_tps
+  SameTokens = $r.phases.baseline.trials[0].token_ids_sha256 -eq $r.phases.stream50.trials[0].token_ids_sha256
+  ExecPlan = $s.exec_plan
+  Calls = $s.gemv_calls
+  Hits = $s.cache_hits
+  Misses = $s.cache_misses
+  ColdFirstMs = [math]::Round($s.gemv_first_ns/1e6,2)
+  WarmAvgMs = [math]::Round($s.gemv_warm_total_ns/$s.gemv_warm_calls/1e6,2)
+  LastExecuteMs = [math]::Round($s.gemv_last_execute_ns/1e6,2)
+  CacheMB = [math]::Round($s.cache_payload_bytes/1MB,2)
+}
+~~~
+
+This is exploratory, not a validated improvement on the full model.
+Compare directly against raw-mode runs under the same settings and
+prefer multiple trials for robust performance estimates. A small
+synthetic Q4_K test showed 1.18 ms raw vs 0.98 ms plan for warm GEMVs;
+these figures do not predict Qwen speed. More importantly, a
+single matrix nearly fills the stream10 budget in RAW mode; decoded
+plan bytes may exceed that budget and force cache eviction. Do not
+equate decoded-cache limit with total RAM or GPU VRAM savings.
+
+Numerical parity of full-model logits has NOT been demonstrated;
+identical generated token IDs alone are insufficient.
