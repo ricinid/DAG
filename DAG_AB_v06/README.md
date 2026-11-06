@@ -514,3 +514,49 @@ Next correctness gate: if shadow output differs, compare its deviations
 with a Q8_K / Q8_0-quantized activation reference, and verify logits for
 the exact shared prefix before token #12. A small nonzero max error
 does not automatically imply a semantically relevant argmax flip.
+
+## Shadow Q8 activation-roundtrip diagnostic
+
+From 11 true CPU-extra shadow comparisons of blk.0.ffn_gate.weight:
+all 11008 FP32 outputs differ, no non-finite values, RMSE
+~0.00210 to 0.00320, max absolute difference <=0.02056.
+This is consistent with but does NOT establish Q8 input quantization
+as the explanation. CPU-extra may also have different fused arithmetic.
+
+The follow-up extension measures two deviations from exactly the SAME
+GGML reference output: DAG(original F32 activation) and
+DAG(dequantize(quantize(F32))) using the pinned GGML Q8_K/Q8_0 CPU
+quantizer. The second one is diagnostic ONLY: it is invoked through
+dag_try_ggml_gemv and restores the original DAG(F32) result before
+the graph continues. It consumes an extra native GEMV per shadow call
+and changes log counters/timings. Never benchmark with shadow enabled.
+
+Install only after install_shadow_gemv.py was already applied:
+
+~~~powershell
+git pull --ff-only
+python DAG_AB_v06\extend_shadow_q8.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+$env:DAG_SHADOW_CHECK = '1'
+$env:DAG_SHADOW_MAX = '11'
+try {
+  python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_shadow_q8_12_01 --modes stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --trials 1 --num-predict 12
+} finally {
+  Remove-Item Env:DAG_SHADOW_CHECK, Env:DAG_SHADOW_MAX -ErrorAction SilentlyContinue
+}
+Select-String dag_results\native_shadow_q8_12_01\stream50.server.log -Pattern '\[DAG shadow q8\]' | ForEach-Object { $_.Line }
+~~~
+
+Interpretation: If the q8 RMSE falls by orders of magnitude versus
+rmse_f32, most of the observed numerical deviation is likely due to
+GGML's activation quantization. If not, investigate dequantized weight
+equality and CPU-extra fused dot arithmetic. The second path uses
+GGML CPU quantize_row_q8_K/q8_0 functions, but is not an assertion
+that every CPU-extra implementation uses identical quantizer details.
+
+Even negligible per-matmul RMSE does NOT imply same greedy tokens:
+logit margin and accumulation through subsequent layers decide that.
+Do not silently change default numeric semantics to force token parity.
