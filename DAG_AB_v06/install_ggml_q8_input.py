@@ -25,12 +25,12 @@ INCLUDE = '#include "ggml-quants.h"'
 # The call, in its existing early hook. Any shadow instrumentation is inside
 # this call's body and MUST remain attached to native-f32 mode only.
 CALL = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)if[ \t]*\("
-    r"dag_try_ggml_gemv\(src0->name,[ \t]*params->ith,[ \t]*"
-    r"\(const float \*\)[ \t]*src1->data,[ \t]*"
-    r"\(uint64_t\)[ \t]*src1->ne\[0\],[ \t]*"
-    r"\(float \*\)[ \t]*dst->data,[ \t]*"
-    r"\(uint64_t\)[ \t]*src0->ne\[1\]\)\)[ \t]*\{",
+    r"^(?P<indent>[ \t]*)if[ \t]*\(\s*"
+    r"dag_try_ggml_gemv\(src0->name,\s*params->ith,\s*"
+    r"\(const float \*\)\s*src1->data,\s*"
+    r"\(uint64_t\)\s*src1->ne\[0\],\s*"
+    r"\(float \*\)\s*dst->data,\s*"
+    r"\(uint64_t\)\s*src0->ne\[1\]\)\)\s*\{",
     re.MULTILINE,
 )
 
