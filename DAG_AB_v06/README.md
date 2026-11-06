@@ -454,3 +454,63 @@ GGML Q4_0/Q4_K output for the SAME float32 vector; (4) examine quant
 decode, scaling/offset, accumulation order and floating-point rounding.
 A greedy token flip can arise from near-tied logits, so token mismatch
 alone does not establish that DAG reconstruction is wrong.
+
+## Shadow GEMV parity at the 12th generated token
+
+The first captured 32-token divergence is 0-based index 11 (token #12):
+GGML token ID 7525 versus decoded DAG token ID 4357. Both runs captured
+32/32 token IDs, with 11 matching prefix tokens. This is NOT by itself
+proof that reconstruction of quantized weights is incorrect.
+
+Important semantic difference in pinned upstream llama.cpp:
+ggml-cpu.c type traits use Q4_K x Q8_K and Q4_0 x Q8_0 vector dots.
+For normal CPU MUL_MAT, F32 input is converted using the vec_dot_type
+from_float function before the dot. Native DAG currently multiplies by
+the ORIGINAL F32 x and accumulates as double. This may explain greedy
+argmax flips near a tie; quantify before changing the DAG compiler.
+
+New script install_shadow_gemv.py adds DAG_SHADOW_CHECK=1 to the
+existing early hook. On each successful DAG GEMV, it:
+1. saves the DAG F32 result vector;
+2. invokes the same GGML cpu-extra dispatch used without the hook
+   (or the normal CPU mul_mat fallback) on the SAME input tensors;
+3. logs per-op RMSE, max abs error, row and route;
+4. restores the DAG output before inference continues.
+This is an expensive diagnostic and OFF by default. It does not
+persist activations or change the resulting DAG output vector.
+
+Apply only once to the ALREADY PATCHED llama-dag checkout:
+
+~~~powershell
+git pull --ff-only
+python DAG_AB_v06\install_shadow_gemv.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+$env:DAG_SHADOW_CHECK = '1'
+$env:DAG_SHADOW_MAX = '11'
+try {
+  python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_shadow_12_01 --modes stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --trials 1 --num-predict 12
+} finally {
+  Remove-Item Env:DAG_SHADOW_CHECK, Env:DAG_SHADOW_MAX -ErrorAction SilentlyContinue
+}
+Select-String dag_results\native_shadow_12_01\stream50.server.log -Pattern '\[DAG shadow\]' | ForEach-Object { $_.Line }
+~~~
+
+Expected: up to 11 shadow lines; each represents the same F32
+activations processed by DAG and by original GGML CPU dispatch. The
+11th GEMV typically generates token #12: there are n_predict-1
+single-batch GEMV calls in the preceding smoke runs. Confirm call count
+using the emitted native STATS; do not infer from position alone.
+
+WARNING: shadow comparison executes additional GGML work, changing
+latency and possibly mutating backend workspaces. Use only for numerical
+diagnostics; never treat shadow-mode tok/s as valid A/B performance.
+Installed code is rejected on duplicate patch applications or missing
+early hook. To turn it off without rebuilding, omit DAG_SHADOW_CHECK.
+
+Next correctness gate: if shadow output differs, compare its deviations
+with a Q8_K / Q8_0-quantized activation reference, and verify logits for
+the exact shared prefix before token #12. A small nonzero max error
+does not automatically imply a semantically relevant argmax flip.
