@@ -560,3 +560,59 @@ that every CPU-extra implementation uses identical quantizer details.
 Even negligible per-matmul RMSE does NOT imply same greedy tokens:
 logit margin and accumulation through subsequent layers decide that.
 Do not silently change default numeric semantics to force token parity.
+
+## Route Q8 shadow output to test the 12th-token hypothesis
+
+The 11-call shadow comparison strongly supports activation Q8
+quantization as the source of the matrix-output deviation:
+rmse_f32 ~0.0021-0.0032; rmse_q8 ~3.17e-8 to 7.30e-8.
+That is an improvement of ~34,000-77,000x and max_abs_q8
+<= 4.77e-7. Thousands of different FP32 bit patterns are compatible
+with this small roundoff-level absolute error.
+
+This still does NOT prove that Q8 input semantics caused the 12th
+token flip (baseline token 7525 vs DAG token 4357). For that causal
+gate, the opt-in installer route_shadow_q8_output.py rewrites the
+already-installed shadow Q8 block so that DAG(Q8->F32), rather than
+DAG(original F32), continues through the remaining model layers.
+Default execution remains unchanged. This is strictly diagnostic:
+each shadow call still executes both native DAG versions and the
+ordinary GGML reference. Throughput, GEMV counts and memory are
+not comparable to normal A/B; only token parity matters.
+
+Do not reapply earlier shadow installers. Once Q8 roundtrip is present:
+
+~~~powershell
+git pull --ff-only
+python DAG_AB_v06\route_shadow_q8_output.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+$env:DAG_SHADOW_CHECK = '1'
+$env:DAG_SHADOW_MAX = '11'
+$env:DAG_SHADOW_Q8_OUTPUT = '1'
+try {
+  python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_q8_route_12_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --trials 1 --num-predict 12
+} finally {
+  Remove-Item Env:DAG_SHADOW_CHECK, Env:DAG_SHADOW_MAX, Env:DAG_SHADOW_Q8_OUTPUT -ErrorAction SilentlyContinue
+}
+$r = Get-Content dag_results\native_q8_route_12_01\full_inference_ab.json -Raw | ConvertFrom-Json
+$cmp = $r.phases.stream50.relative_to_baseline.token_comparison_first_trial
+$lines = @(Select-String dag_results\native_q8_route_12_01\stream50.server.log -Pattern '\[DAG shadow q8 route\].*q8_output=1')
+[PSCustomObject]@{ TokenParity=$cmp.status; MatchingPrefix=$cmp.matching_prefix_tokens; FirstMismatch=$cmp.first_mismatch_position; Q8RoutedCalls=$lines.Count }
+~~~
+
+Validation: token capture must be complete (the token_comparison status
+must not be unknown); expect exactly 11 '[DAG shadow q8 route]' lines.
+If token parity becomes equal through 12 outputs, the new test
+demonstrates that Q8-compatible input semantics resolve the first
+observed divergence for this prompt. This is NOT a logits-parity proof,
+and longer completions require separate validation. If it still differs,
+inspect token margins/logits at the first differing prefix instead of
+modifying the compiler blindly.
+
+Once this passes, implement a normal optional GGML-compatible mode
+without shadow double-execution, and benchmark it separately. Retain
+the original F32/double DAG mode for an accuracy-vs-compatibility
+comparison; do not silently change production numerical semantics.
