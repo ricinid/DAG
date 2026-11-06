@@ -34,7 +34,7 @@ class H(BaseHTTPRequestHandler):
   self.wfile.write(b'data: {"content":"","stop":true,"timings":{"predicted_n":2,"predicted_per_second":18,"prompt_n":5,"prompt_per_second":20}}\\n\\n')
   self.wfile.flush()
   if os.environ.get('DAG_STREAM_DIR'):
-   print('[DAG native] STATS '+json.dumps({'stats_every':int(os.environ.get('DAG_STATS_EVERY','1000')),'gemv_calls':99,'cache_hits':10}),file=sys.stderr,flush=True)
+   print('[DAG native] STATS '+json.dumps({'exec_plan':int(os.environ.get('DAG_EXEC_PLAN','0')),'stats_every':int(os.environ.get('DAG_STATS_EVERY','1000')),'gemv_calls':99,'cache_hits':10}),file=sys.stderr,flush=True)
 ThreadingHTTPServer(('127.0.0.1',a.port),H).serve_forever()
 '''
 
@@ -101,3 +101,20 @@ def test_zero_baseline_ttft_does_not_fail_full_report(tmp_path, monkeypatch):
     ratio = report['phases']['stream50']['relative_to_baseline']
     assert ratio['ttft_ratio'] is None
     assert ratio['decode_speedup'] == 1.0
+
+
+def test_decoded_execution_mode_survives_report(tmp_path):
+    gguf, _ = fake_gguf(tmp_path, 2, rows=3, cols=256)
+    compiled = tmp_path / 'compiled'
+    compile_full(gguf, compiled, rows=3, cols=256, max_nodes=2)
+    fake = tmp_path / 'fake-server.py'
+    fake.write_text(FAKE_SERVER)
+    out = tmp_path / 'ab_decoded'
+    assert main(['--server', str(fake), '--gguf', str(gguf),
+                 '--compiled', str(compiled), '--out-dir', str(out),
+                 '--port', '19989', '--trials', '1',
+                 '--modes', 'stream50', '--dag-execution', 'decoded',
+                 '--dag-tensors', 'blk.0.ffn_gate.weight']) == 0
+    report = json.loads((out / 'full_inference_ab.json').read_text())
+    assert report['phases']['stream50']['dag_execution'] == 'decoded'
+    assert report['phases']['stream50']['dag_native_stats']['exec_plan'] == 1
