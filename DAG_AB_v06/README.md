@@ -413,3 +413,44 @@ equate decoded-cache limit with total RAM or GPU VRAM savings.
 
 Numerical parity of full-model logits has NOT been demonstrated;
 identical generated token IDs alone are insufficient.
+
+## v0.6: 32-token parity regression and first-divergence diagnosis
+
+Qwen 32-token single-tensor benchmark: raw DAG 2.492 tok/s (0.484x
+baseline) versus decoded DAG 3.138 tok/s (0.654x baseline). Warm GEMV
+changed from 92.98 ms to 26.41 ms; both modes had 31 GEMV calls.
+Both modes returned SameTokens=False against their respective GGML
+baselines. Do NOT expand scope without checking the earliest divergence.
+
+Old JSON reports contain token hashes and text but not token ID arrays.
+Inspect existing reports without rerunning inference:
+
+~~~powershell
+git pull --ff-only
+python DAG_AB_v06\compare_generation_parity.py dag_results\native_raw_32tokens_01\full_inference_ab.json dag_results\native_decoded_32tokens_01\full_inference_ab.json
+~~~
+
+Legacy reports can locate the first different TEXT CHARACTER only.
+The new Python harness saves complete streamed token IDs and per-run
+capture completeness. Its comparison reports first_mismatch_index
+(zero-based), matching_prefix_tokens, baseline_token_id and
+candidate_token_id. If capture is incomplete, parity is null, not
+an ungrounded match of SHA256 hashes of empty arrays.
+
+Rerun 32 tokens using the updated Python harness without C++ rebuild:
+
+~~~powershell
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_decoded_parity_32_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --trials 1 --num-predict 32
+python DAG_AB_v06\compare_generation_parity.py dag_results\native_decoded_parity_32_01\full_inference_ab.json
+~~~
+
+Correctness gates after locating first token mismatch: (1) compare raw
+versus decoded tokens on identical inference settings; (2) compare
+logits using the SAME prompt and prefix; (3) compare native DAG and
+GGML Q4_0/Q4_K output for the SAME float32 vector; (4) examine quant
+decode, scaling/offset, accumulation order and floating-point rounding.
+A greedy token flip can arise from near-tied logits, so token mismatch
+alone does not establish that DAG reconstruction is wrong.
