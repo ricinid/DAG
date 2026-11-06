@@ -186,6 +186,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     env.pop('DAG_CACHE_BYTES',None)
     env.pop('DAG_TENSOR_ALLOW',None)
     env.pop('DAG_STATS_EVERY',None)
+    env.pop('DAG_EXEC_PLAN',None)
     budget=None
     stats_every=None
     if mode!='baseline':
@@ -198,6 +199,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
         stats_every=(args.dag_stats_every if args.dag_stats_every is not None
                      else (1 if args.dag_tensors != 'all' else 1000))
         env['DAG_STATS_EVERY']=str(stats_every)
+        env['DAG_EXEC_PLAN']='1' if args.dag_execution=='decoded' else '0'
     logfile=args.out_dir / (mode+'.server.log')
     # A .py mock server is launched through the active interpreter on every OS.
     # Production llama-server binaries remain direct executables, so an invalid
@@ -210,6 +212,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     obj={'status':'started','mode':mode,'cache_budget_bytes':budget,
          'started_utc':now(),'server_command':cmd,'trials':[],
          'dag_tensor_scope':args.dag_tensors if mode!='baseline' else None,
+         'dag_execution':args.dag_execution if mode!='baseline' else None,
          'dag_native_stats_sample_interval':stats_every,
          'dag_native_stats_exact_after_completed_trials':stats_every==1}
     with logfile.open('w',encoding='utf-8') as log:
@@ -235,6 +238,9 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     obj['server_returncode']=proc.returncode
     if mode!='baseline':
         stats=obj['dag_native_stats']
+        if stats and (args.dag_execution=='decoded' and stats.get('exec_plan') != 1 or
+                      args.dag_execution=='raw' and stats.get('exec_plan') not in (None, 0)):
+            raise RuntimeError(f'{mode}: native execution plan mismatch; update dag_runtime.cpp and rebuild llama-server')
         if stats and stats.get('stats_every') != stats_every:
             raise RuntimeError(f'{mode}: DAG stats interval mismatch: runtime reports '
                                f'{stats.get("stats_every")}, harness expects {stats_every}. '
@@ -260,6 +266,8 @@ def main(argv=None):
     p.add_argument('--out-dir',required=True,type=Path)
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
     p.add_argument('--dag-tensors',default='all',help='all OR exact comma-separated GGUF tensor names (for smoke)')
+    p.add_argument('--dag-execution',choices=('raw','decoded'),default='raw',
+                   help='Raw bytecode interpreter (default) vs opt-in predecoded execution plan')
     p.add_argument('--dag-stats-every',type=int,default=None,
                    help='Log native stats every N GEMVs (default: 1 for targeted smoke, 1000 for all). '
                         'Logging each full-model GEMV distorts benchmark timings.')
