@@ -13,6 +13,7 @@ from test_ollama_dag_pipeline import fake_gguf
 from whole_model_dag import compile_full
 from run_llama_ab import main, ratio_or_none
 import run_llama_ab
+from run_llama_ab import compare_token_sequences
 
 FAKE_SERVER = '''#!/usr/bin/env python3
 import argparse,json,os,time,sys
@@ -59,6 +60,9 @@ def test_full_four_stage_harness_and_ratios(tmp_path):
         assert d['dag_native_stats']['stats_every']==1
         assert d['dag_native_stats_sample_interval']==1
         assert d['dag_native_stats_exact_after_completed_trials'] is True
+        assert d['trials'][0]['token_ids'] == [123, 124]
+        assert d['trials'][0]['token_ids_complete'] is True
+        assert d['relative_to_baseline']['token_comparison_first_trial']['status'] == 'equal'
         assert d['relative_to_baseline']['same_token_ids_first_trial']
     assert report['phases']['stream50']['cache_budget_bytes']==gguf.stat().st_size//2
     assert report['phases']['stream10']['cache_budget_bytes']==int(gguf.stat().st_size*.1)
@@ -118,3 +122,26 @@ def test_decoded_execution_mode_survives_report(tmp_path):
     report = json.loads((out / 'full_inference_ab.json').read_text())
     assert report['phases']['stream50']['dag_execution'] == 'decoded'
     assert report['phases']['stream50']['dag_native_stats']['exec_plan'] == 1
+
+
+def test_token_comparison_classifies_divergence_and_missing_capture():
+    good=lambda ids: {'token_ids': ids, 'token_ids_complete': True}
+    equal=compare_token_sequences(good([1,2,3]),good([1,2,3]))
+    assert equal['status']=='equal' and equal['same_token_ids']
+    different=compare_token_sequences(good([1,2,3]),good([1,2,4]))
+    assert different['status']=='different'
+    assert different['first_mismatch_index']==2
+    assert different['first_mismatch_position']==3
+    assert different['baseline_token_id']==3
+    assert different['candidate_token_id']==4
+    assert different['matching_prefix_tokens']==2
+    short=compare_token_sequences(good([1,2]),good([1,2,3]))
+    assert short['first_mismatch_index']==2
+    assert short['baseline_token_id'] is None
+    assert short['candidate_token_id']==3
+    missing=compare_token_sequences({'token_ids':[1,2],'token_ids_complete':False},
+                                     {'token_ids':[1,2],'token_ids_complete':False})
+    assert missing['status']=='unknown'
+    assert missing.get('same_token_ids') is None
+    legacy=compare_token_sequences({'token_ids_sha256':'x'},good([1,2]))
+    assert legacy['status']=='unknown'
