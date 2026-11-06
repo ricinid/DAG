@@ -616,3 +616,64 @@ Once this passes, implement a normal optional GGML-compatible mode
 without shadow double-execution, and benchmark it separately. Retain
 the original F32/double DAG mode for an accuracy-vs-compatibility
 comparison; do not silently change production numerical semantics.
+
+## Single-pass GGML-Q8 compatibility (normal inference, no shadow)
+
+The 12-token experiment passed its causal gate: 12/12 tokens match
+GGML after 11 verified Q8-routed DAG GEMVs. This establishes that
+the activation quantization difference resolves the FIRST observed
+divergence for this single tensor and prompt, not full logits parity.
+
+The new optional installer install_ggml_q8_input.py adds
+DAG_INPUT_SEMANTICS=native-f32 (default) or ggml-q8 to the EARLY GGML
+GEMV bridge, without changing the native DAG stream, cache or IR.
+With ggml-q8, an eligible, allowlisted GEMV does the pinned GGML
+CPU Q8_K/Q8_0 quantization and dequantization of F32 activations,
+then calls the native DAG executor exactly ONCE. The existing
+native-f32 branch (and its shadow instrumentation) stays intact.
+After a completed Q8 DAG call, the server logs
+'[DAG q8 normal] tensor=... quant_type=... call=1' once.
+The harness checks for that marker and fails if the bridge was not
+installed/rebuilt. This preliminary bridge allocates temporary
+buffers for each call. Do not treat it as a final optimized kernel.
+
+Install ONCE on an already patched llama-dag checkout (the shadow
+patches installed earlier can remain in the source but are not
+invoked in normal ggml-q8 mode):
+
+~~~powershell
+git pull --ff-only
+python DAG_AB_v06\install_ggml_q8_input.py --llama-src ..\llama-dag
+cmake --build ..\llama-dag\build-dag --config Release --target llama-server
+$server = (Resolve-Path ..\llama-dag\build-dag\bin\Release\llama-server.exe).Path
+$compiled = (Resolve-Path .\dag_results\qwen_ab_02\compiled).Path
+$report = Get-Content "$compiled\full_model_report.json" -Raw | ConvertFrom-Json
+Remove-Item Env:DAG_SHADOW_CHECK, Env:DAG_SHADOW_MAX, Env:DAG_SHADOW_Q8_OUTPUT -ErrorAction SilentlyContinue
+python DAG_AB_v06\run_llama_ab.py --server $server --gguf $report.source_path --compiled $compiled --out-dir dag_results\native_singlepass_q8_32_01 --modes baseline stream50 --dag-tensors blk.0.ffn_gate.weight --dag-execution decoded --dag-input-semantics ggml-q8 --trials 1 --num-predict 32
+$r = Get-Content dag_results\native_singlepass_q8_32_01\full_inference_ab.json -Raw | ConvertFrom-Json
+$cmp = $r.phases.stream50.relative_to_baseline.token_comparison_first_trial
+[PSCustomObject]@{
+  Parity = $cmp.status
+  Prefix = $cmp.matching_prefix_tokens
+  FirstMismatch = $cmp.first_mismatch_position
+  BridgeConfirmed = $r.phases.stream50.dag_q8_bridge_confirmed
+  GemvCalls = $r.phases.stream50.dag_native_stats.gemv_calls
+  BaselineTPS = $r.phases.baseline.median_decode_tps
+  DagTPS = $r.phases.stream50.median_decode_tps
+}
+~~~
+
+Expected diagnostic conditions: BridgeConfirmed=True, GEMV=31
+(assuming all 32 tokens generated), and complete token capture.
+Parity='equal' would extend the compatibility observation to 32
+tokens under this exact prompt, not certify all-model equivalence.
+If a mismatch reappears, inspect first_mismatch_token_index and
+logits of the exact common-prefix candidates before making a
+numerical-semantics change.
+
+Important: baseline and ggml-q8 use the same patched server binary
+but baseline has no DAG_STREAM_DIR. Never leave DAG_SHADOW_CHECK=1
+inherited while measuring normal throughput. The previous 1.98 tok/s
+was a shadow run and is not comparable to single-pass performance.
+After this one-trial correctness gate, run several trials and test
+other tensor classes before promoting this runtime mode.
