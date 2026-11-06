@@ -218,6 +218,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     env.pop('DAG_TENSOR_ALLOW',None)
     env.pop('DAG_STATS_EVERY',None)
     env.pop('DAG_EXEC_PLAN',None)
+    env.pop('DAG_INPUT_SEMANTICS',None)
     budget=None
     stats_every=None
     if mode!='baseline':
@@ -231,6 +232,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
                      else (1 if args.dag_tensors != 'all' else 1000))
         env['DAG_STATS_EVERY']=str(stats_every)
         env['DAG_EXEC_PLAN']='1' if args.dag_execution=='decoded' else '0'
+        env['DAG_INPUT_SEMANTICS']=args.dag_input_semantics
     logfile=args.out_dir / (mode+'.server.log')
     # A .py mock server is launched through the active interpreter on every OS.
     # Production llama-server binaries remain direct executables, so an invalid
@@ -244,6 +246,7 @@ def phase(mode:str,args,report:dict,source_bytes:int):
          'started_utc':now(),'server_command':cmd,'trials':[],
          'dag_tensor_scope':args.dag_tensors if mode!='baseline' else None,
          'dag_execution':args.dag_execution if mode!='baseline' else None,
+         'dag_input_semantics':args.dag_input_semantics if mode!='baseline' else None,
          'dag_native_stats_sample_interval':stats_every,
          'dag_native_stats_exact_after_completed_trials':stats_every==1}
     with logfile.open('w',encoding='utf-8') as log:
@@ -265,6 +268,15 @@ def phase(mode:str,args,report:dict,source_bytes:int):
                 except subprocess.TimeoutExpired:
                     proc.kill();proc.wait(timeout=5)
     obj['dag_native_stats']=extract_dag_stats(logfile)
+    # Prove the requested compatibility bridge was actually executed.
+    # Old patched GGML binaries must fail, not silently report native F32.
+    obj['dag_q8_bridge_confirmed']=None
+    if mode!='baseline' and args.dag_input_semantics=='ggml-q8':
+        obj['dag_q8_bridge_confirmed']='[DAG q8 normal] tensor=' in logfile.read_text(encoding='utf-8',errors='replace')
+        if not obj['dag_q8_bridge_confirmed']:
+            raise RuntimeError(f'{mode}: ggml-q8 requested but single-pass GGML bridge did not run. '
+                               'Install DAG_AB_v06/install_ggml_q8_input.py into llama-dag, '
+                               'rebuild llama-server and check the tensor allowlist.')
     obj['finished_utc']=now()
     obj['server_returncode']=proc.returncode
     if mode!='baseline':
@@ -297,6 +309,9 @@ def main(argv=None):
     p.add_argument('--out-dir',required=True,type=Path)
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
     p.add_argument('--dag-tensors',default='all',help='all OR exact comma-separated GGUF tensor names (for smoke)')
+    p.add_argument('--dag-input-semantics',choices=('native-f32','ggml-q8'),
+                   default='native-f32',
+                   help='Use original F32 activations (default) or GGML Q8-quantize/dequantize input before one DAG GEMV')
     p.add_argument('--dag-execution',choices=('raw','decoded'),default='raw',
                    help='Raw bytecode interpreter (default) vs opt-in predecoded execution plan')
     p.add_argument('--dag-stats-every',type=int,default=None,
@@ -328,7 +343,8 @@ def main(argv=None):
             'source_sha256':meta['source_sha256'],'source_bytes':meta['original_gguf_bytes'],
             'compiled':str(a.compiled),'prompt':a.prompt,
             'settings':{'temperature':0,'seed':a.seed,'num_predict':a.num_predict,
-                        'ctx':a.ctx,'trials':a.trials,'cpu_threads':1,'gpu_layers':0},
+                        'ctx':a.ctx,'trials':a.trials,'cpu_threads':1,'gpu_layers':0,
+                        'dag_input_semantics':a.dag_input_semantics},
             'scope':{'full_model_token_generation':True,'dag_exec':'CPU Q4_0/Q4_K GEMV only',
                 'original_weight_allocation_eliminated':False,
                 'dag_tensor_scope':a.dag_tensors,
