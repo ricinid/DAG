@@ -2,6 +2,7 @@
 #include <zlib.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +24,10 @@
 namespace {
 constexpr size_t kMaxZipBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxInflatedBytes = 64u * 1024u * 1024u;
+using DagClock = std::chrono::steady_clock;
+uint64_t elapsed_ns(DagClock::time_point a, DagClock::time_point b) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
 
 uint16_t u16(const uint8_t * p) { return uint16_t(p[0]) | uint16_t(p[1]) << 8; }
 uint32_t u32(const uint8_t * p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 |
@@ -215,12 +220,34 @@ public:
             std::fprintf(stderr,"[DAG native] shape or coverage mismatch: %s\n",tensor_name);return -1;
         }
         try {
+            const auto gemv_start = DagClock::now();
+            const uint64_t misses_before = misses_;
+            uint64_t local_load_ns = 0, local_execute_ns = 0;
             std::vector<double> accum(m, 0.);
             for (const auto & r : t.records) {
+                const auto load_start = DagClock::now();
                 auto u = load(r);
+                const auto execute_start = DagClock::now();
                 execute(*u,r,x,accum);
+                const auto execute_end = DagClock::now();
+                local_load_ns += elapsed_ns(load_start, execute_start);
+                local_execute_ns += elapsed_ns(execute_start, execute_end);
             }
             for (size_t i=0;i<m;i++) y[i]=static_cast<float>(accum[i]);
+            // Exclude diagnostic logging from the measured kernel duration.
+            gemv_last_ns_ = elapsed_ns(gemv_start, DagClock::now());
+            gemv_last_load_ns_ = local_load_ns;
+            gemv_last_execute_ns_ = local_execute_ns;
+            if (matvecs_ == 0) gemv_first_ns_ = gemv_last_ns_;
+            gemv_total_ns_ += gemv_last_ns_;
+            gemv_load_total_ns_ += local_load_ns;
+            gemv_execute_total_ns_ += local_execute_ns;
+            if (misses_before == misses_) {
+                ++gemv_warm_calls_;
+                gemv_warm_total_ns_ += gemv_last_ns_;
+            } else {
+                ++gemv_cold_calls_;
+            }
             ++matvecs_;
             if (matvecs_ == 1 || matvecs_ % stats_every_ == 0) {
                 std::fprintf(stderr,"[DAG native] STATS %s\n",stats().c_str());
@@ -235,7 +262,19 @@ public:
         std::ostringstream out;
         out << "{\"stats_every\":" << stats_every_ << ",\"gemv_calls\":" << matvecs_ << ",\"cache_hits\":" << hits_ <<
                ",\"cache_misses\":" << misses_ << ",\"stream_bytes_read\":" << read_bytes_ <<
-               ",\"cache_payload_bytes\":" << cache_used_ << ",\"cache_budget_bytes\":" << budget_ << "}";
+               ",\"cache_payload_bytes\":" << cache_used_ << ",\"cache_budget_bytes\":" << budget_ <<
+               ",\"gemv_first_ns\":" << gemv_first_ns_ <<
+               ",\"gemv_last_ns\":" << gemv_last_ns_ <<
+               ",\"gemv_last_load_ns\":" << gemv_last_load_ns_ <<
+               ",\"gemv_last_execute_ns\":" << gemv_last_execute_ns_ <<
+               ",\"gemv_total_ns\":" << gemv_total_ns_ <<
+               ",\"gemv_load_total_ns\":" << gemv_load_total_ns_ <<
+               ",\"gemv_execute_total_ns\":" << gemv_execute_total_ns_ <<
+               ",\"gemv_cold_calls\":" << gemv_cold_calls_ <<
+               ",\"gemv_warm_calls\":" << gemv_warm_calls_ <<
+               ",\"gemv_warm_total_ns\":" << gemv_warm_total_ns_ <<
+               ",\"stream_io_total_ns\":" << stream_io_total_ns_ <<
+               ",\"unit_materialize_total_ns\":" << unit_materialize_total_ns_ << "}";
         return out.str();
     }
 private:
@@ -245,6 +284,13 @@ private:
     std::unordered_map<uint64_t,decltype(cache_)::iterator> lookup_;
     size_t cache_used_ = 0;
     uint64_t hits_=0, misses_=0, read_bytes_=0, matvecs_=0;
+    // Monotonic wall-time accounting, sampled only for GEMVs completed successfully.
+    // Timings use steady_clock, exclude STATS logging and include profiler overhead.
+    uint64_t gemv_first_ns_=0, gemv_last_ns_=0, gemv_total_ns_=0;
+    uint64_t gemv_last_load_ns_=0, gemv_last_execute_ns_=0;
+    uint64_t gemv_load_total_ns_=0, gemv_execute_total_ns_=0;
+    uint64_t gemv_cold_calls_=0, gemv_warm_calls_=0, gemv_warm_total_ns_=0;
+    uint64_t stream_io_total_ns_=0, unit_materialize_total_ns_=0;
     std::shared_ptr<Unit> load(const Record & r) {
         auto it = lookup_.find(r.offset);
         if (it != lookup_.end()) {
@@ -252,6 +298,7 @@ private:
             ++hits_; return cache_.front().second;
         }
         ++misses_;
+        const auto read_start = DagClock::now();
 #if defined(_WIN32)
         if (_fseeki64(file_, static_cast<int64_t>(r.offset), SEEK_SET)) throw std::runtime_error("Seek failed");
 #else
@@ -263,6 +310,8 @@ private:
         if (r.size > kMaxZipBytes) throw std::runtime_error("Record exceeds safety limit");
         std::vector<uint8_t> zip(r.size);
         if (std::fread(zip.data(),1,r.size,file_) != r.size) throw std::runtime_error("Truncated record");
+        const auto read_end = DagClock::now();
+        stream_io_total_ns_ += elapsed_ns(read_start, read_end);
         read_bytes_ += r.size + 8;
         auto u=std::make_shared<Unit>();
         auto info=zip_field(zip.data(),zip.size(),"info.json");
@@ -287,6 +336,8 @@ private:
             lookup_[r.offset]=cache_.begin();
             cache_used_ += extra;
         }
+        // ZIP decompression, metadata parsing, DAG inflation and cache management.
+        unit_materialize_total_ns_ += elapsed_ns(read_end, DagClock::now());
         return u;
     }
     static void execute(const Unit & u, const Record & r, const float * x, std::vector<double> & y) {
