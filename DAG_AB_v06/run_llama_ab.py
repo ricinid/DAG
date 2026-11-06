@@ -136,6 +136,31 @@ def server_health(base:str,proc:subprocess.Popen,timeout:float):
     raise TimeoutError(f'Could not start llama-server in {timeout}s')
 
 
+def compare_token_sequences(reference:dict, candidate:dict):
+    """Compare actual streamed token IDs, not only hashes.
+
+    Do not claim parity if either capture was incomplete or unavailable:
+    sha256([]) == sha256([]) is not evidence of equivalent inference.
+    Indices in divergence metadata are zero-based.
+    """
+    a=reference.get('token_ids')
+    b=candidate.get('token_ids')
+    if not isinstance(a,list) or not isinstance(b,list):
+        return {'status':'unknown','reason':'token IDs missing from one or both reports'}
+    if not reference.get('token_ids_complete') or not candidate.get('token_ids_complete'):
+        return {'status':'unknown','reason':'stream token capture incomplete',
+                'baseline_ids_captured':len(a),'candidate_ids_captured':len(b)}
+    i=next((i for i,(x,y) in enumerate(zip(a,b)) if x!=y),min(len(a),len(b)))
+    if i==len(a)==len(b):
+        return {'status':'equal','same_token_ids':True,'matching_prefix_tokens':i,
+                'baseline_count':len(a),'candidate_count':len(b)}
+    return {'status':'different','same_token_ids':False,
+            'first_mismatch_index':i,'first_mismatch_position':i+1,
+            'matching_prefix_tokens':i,'baseline_count':len(a),'candidate_count':len(b),
+            'baseline_token_id':a[i] if i<len(a) else None,
+            'candidate_token_id':b[i] if i<len(b) else None}
+
+
 def completion(base:str,prompt:str,predict:int,seed:int,timeout:float):
     body={'prompt':prompt,'stream':True,'n_predict':predict,'temperature':0,
           'seed':seed,'cache_prompt':False,'return_tokens':True,
@@ -162,6 +187,8 @@ def completion(base:str,prompt:str,predict:int,seed:int,timeout:float):
     timings=final.get('timings',{})
     if not timings:raise RuntimeError('llama-server did not return timings')
     text=''.join(output)
+    predicted=timings.get('predicted_n')
+    capture_complete=(isinstance(predicted,int) and len(token_ids)==predicted)
     return {'client_ttft_s':first,'client_total_s':total,
             'decode_tokens':timings.get('predicted_n'),
             'decode_tps':timings.get('predicted_per_second'),
@@ -170,6 +197,10 @@ def completion(base:str,prompt:str,predict:int,seed:int,timeout:float):
             'timings':timings,
             'text_sha256':hashlib.sha256(text.encode()).hexdigest(),
             'token_ids_sha256':hashlib.sha256(json.dumps(token_ids).encode()).hexdigest(),
+            'token_ids':token_ids,
+            'token_ids_captured':len(token_ids),
+            'token_ids_complete':capture_complete,
+            'stop_type':final.get('stop_type'),
             'text':text}
 
 
@@ -321,14 +352,17 @@ def main(argv=None):
         ref=report['phases']['baseline']
         for mode,pdata in report['phases'].items():
             if mode=='baseline':continue
+            cmp=compare_token_sequences(ref['trials'][0],pdata['trials'][0])
             pdata['relative_to_baseline']={
                 'decode_speedup':ratio_or_none(pdata['median_decode_tps'], ref['median_decode_tps']),
                 'ttft_ratio':ratio_or_none(pdata['median_client_ttft_s'], ref['median_client_ttft_s']),
                 'peak_rss_ratio':ratio_or_none(
                     pdata['memory']['peak_server_process_tree_rss_bytes'],
                     ref['memory']['peak_server_process_tree_rss_bytes']),
-                'same_token_ids_first_trial':pdata['trials'][0]['token_ids_sha256']==
-                                               ref['trials'][0]['token_ids_sha256']}
+                'same_token_ids_first_trial':cmp.get('same_token_ids'),
+                'token_comparison_first_trial':cmp,
+                'same_text_first_trial':pdata['trials'][0]['text_sha256']==
+                                        ref['trials'][0]['text_sha256']}
     report['status']='complete';report['finished_utc']=now();atomic_json(path,report)
     print(f'Full-model report: {path}',flush=True)
     return 0
