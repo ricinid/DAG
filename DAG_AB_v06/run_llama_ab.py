@@ -185,12 +185,19 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     env.pop('DAG_STREAM_DIR',None)
     env.pop('DAG_CACHE_BYTES',None)
     env.pop('DAG_TENSOR_ALLOW',None)
+    env.pop('DAG_STATS_EVERY',None)
     budget=None
+    stats_every=None
     if mode!='baseline':
         env['DAG_STREAM_DIR']=str(args.compiled.resolve())
         env['DAG_TENSOR_ALLOW']=args.dag_tensors
         budget = 0 if mode=='resident' else int(source_bytes*FRACTIONS[mode])
         env['DAG_CACHE_BYTES']=str(budget)
+        # Windows Popen.terminate() kills the server without C++ atexit.
+        # A targeted smoke test needs a snapshot after EVERY completed GEMV.
+        stats_every=(args.dag_stats_every if args.dag_stats_every is not None
+                     else (1 if args.dag_tensors != 'all' else 1000))
+        env['DAG_STATS_EVERY']=str(stats_every)
     logfile=args.out_dir / (mode+'.server.log')
     # A .py mock server is launched through the active interpreter on every OS.
     # Production llama-server binaries remain direct executables, so an invalid
@@ -202,7 +209,9 @@ def phase(mode:str,args,report:dict,source_bytes:int):
          '-c',str(args.ctx),'--parallel','1']
     obj={'status':'started','mode':mode,'cache_budget_bytes':budget,
          'started_utc':now(),'server_command':cmd,'trials':[],
-         'dag_tensor_scope':args.dag_tensors if mode!='baseline' else None}
+         'dag_tensor_scope':args.dag_tensors if mode!='baseline' else None,
+         'dag_native_stats_sample_interval':stats_every,
+         'dag_native_stats_exact_after_completed_trials':stats_every==1}
     with logfile.open('w',encoding='utf-8') as log:
         proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,env=env)
         try:
@@ -226,6 +235,11 @@ def phase(mode:str,args,report:dict,source_bytes:int):
     obj['server_returncode']=proc.returncode
     if mode!='baseline':
         stats=obj['dag_native_stats']
+        if stats and stats.get('stats_every') != stats_every:
+            raise RuntimeError(f'{mode}: DAG stats interval mismatch: runtime reports '
+                               f'{stats.get("stats_every")}, harness expects {stats_every}. '
+                               'Re-copy DAG_AB_v06/native/dag_runtime.cpp into llama-dag '
+                               'and rebuild llama-server.')
         if not stats or stats['gemv_calls']<1:
             raise RuntimeError(f'{mode}: zero DAG GEMV calls. No genuine DAG A/B. See {logfile}')
     else:
@@ -246,6 +260,9 @@ def main(argv=None):
     p.add_argument('--out-dir',required=True,type=Path)
     p.add_argument('--modes',nargs='+',choices=MODES,default=list(MODES))
     p.add_argument('--dag-tensors',default='all',help='all OR exact comma-separated GGUF tensor names (for smoke)')
+    p.add_argument('--dag-stats-every',type=int,default=None,
+                   help='Log native stats every N GEMVs (default: 1 for targeted smoke, 1000 for all). '
+                        'Logging each full-model GEMV distorts benchmark timings.')
     p.add_argument('--prompt',default='Explain Java happens-before and volatile in 80 words.')
     p.add_argument('--prompt-file',type=Path)
     p.add_argument('--seed',type=int,default=42)
@@ -260,6 +277,8 @@ def main(argv=None):
     if a.prompt_file:a.prompt=a.prompt_file.read_text(encoding='utf-8')
     if not a.server.is_file():p.error(f'No llama-server: {a.server}')
     if a.trials<1:p.error('--trials must be >=1')
+    if a.dag_stats_every is not None and a.dag_stats_every<1:
+        p.error('--dag-stats-every must be >=1')
     if len(a.modes)!=len(set(a.modes)):p.error('Duplicate modes')
     a.gguf=a.gguf.resolve();a.compiled=a.compiled.resolve()
     meta=preflight(a.gguf,a.compiled)
